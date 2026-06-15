@@ -1,4 +1,4 @@
-import os, json, logging, base64
+import os, json, logging, base64, urllib.request, urllib.parse
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -11,10 +11,12 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from groq import Groq
 import pytz
 
-TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
-GROQ_API_KEY   = os.environ["GROQ_API_KEY"]
-YOUR_CHAT_ID   = int(os.environ["YOUR_CHAT_ID"])
-TIMEZONE       = pytz.timezone(os.environ.get("TZ", "Europe/Moscow"))
+TELEGRAM_TOKEN    = os.environ["TELEGRAM_TOKEN"]
+GROQ_API_KEY      = os.environ["GROQ_API_KEY"]
+YOUR_CHAT_ID      = int(os.environ["YOUR_CHAT_ID"])
+TIMEZONE          = pytz.timezone(os.environ.get("TZ", "Asia/Yekaterinburg"))
+WEATHER_API_KEY   = os.environ.get("WEATHER_API_KEY", "")
+CITY              = os.environ.get("CITY", "Yekaterinburg")
 
 DATA_FILE = Path("data.json")
 logging.basicConfig(
@@ -24,6 +26,79 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 client = Groq(api_key=GROQ_API_KEY)
+
+# ─── ПОГОДА ───────────────────────────────────────────────────────────────────
+def get_weather(target_hour: int = 7) -> dict:
+    """Получает погоду на конкретный час завтрашнего дня."""
+    if not WEATHER_API_KEY:
+        return {}
+    try:
+        url = (
+            f"https://api.openweathermap.org/data/2.5/forecast"
+            f"?q={urllib.parse.quote(CITY)}&appid={WEATHER_API_KEY}"
+            f"&units=metric&lang=ru&cnt=16"
+        )
+        with urllib.request.urlopen(url, timeout=5) as resp:
+            data = json.loads(resp.read())
+
+        tomorrow = (datetime.now(TIMEZONE) + timedelta(days=1)).strftime("%Y-%m-%d")
+        best = None
+        best_diff = 999
+
+        for item in data.get("list", []):
+            dt_txt = item.get("dt_txt", "")
+            if not dt_txt.startswith(tomorrow):
+                continue
+            hour = int(dt_txt[11:13])
+            diff = abs(hour - target_hour)
+            if diff < best_diff:
+                best_diff = diff
+                best = item
+
+        if not best:
+            return {}
+
+        main   = best["main"]
+        wind   = best.get("wind", {})
+        rain   = best.get("rain", {}).get("3h", 0)
+        snow   = best.get("snow", {}).get("3h", 0)
+        desc   = best["weather"][0]["description"] if best.get("weather") else ""
+        temp   = round(main.get("temp", 0))
+        feels  = round(main.get("feels_like", 0))
+        speed  = round(wind.get("speed", 0))
+
+        is_bad = rain > 0.5 or snow > 0 or speed > 10
+        emoji  = ("🌧" if rain > 0.5 else "❄️" if snow > 0
+                  else "💨" if speed > 10 else "⛅" if "облач" in desc else "☀️")
+
+        return {
+            "temp": temp,
+            "feels": feels,
+            "desc": desc,
+            "wind_speed": speed,
+            "rain": rain,
+            "snow": snow,
+            "is_bad": is_bad,
+            "emoji": emoji,
+            "bike_ok": not is_bad,
+            "summary": f"{emoji} {temp}°C, {desc}, ветер {speed} м/с" + (f", дождь {rain} мм" if rain else ""),
+            "hour": f"{tomorrow} {target_hour:02d}:00"
+        }
+    except Exception as e:
+        log.warning(f"Weather error: {e}")
+        return {}
+
+def fmt_weather(w: dict, context: str = "утро") -> str:
+    if not w:
+        return ""
+    lines = [f"\n🌤 *Погода на {context}:* {w['summary']}"]
+    if w.get("feels") and abs(w["feels"] - w["temp"]) > 2:
+        lines.append(f"   _↳ Ощущается как {w['feels']}°C_")
+    if w.get("is_bad"):
+        lines.append("   _↳ Велик не берём — плохая погода_")
+    else:
+        lines.append("   _↳ Погода норм — велик берём! 🚴_")
+    return "\n".join(lines)
 
 TEXT_MODEL   = "llama-3.3-70b-versatile"
 VISION_MODEL = "llama-3.2-11b-vision-preview"
@@ -305,15 +380,26 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_workout(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     data = load_data()
     weekday = datetime.now(TIMEZONE).strftime("%A")
-    weather = " ".join(ctx.args) if ctx.args else "ясно"
+    weather_arg = " ".join(ctx.args) if ctx.args else ""
+    weather = get_weather(target_hour=datetime.now(TIMEZONE).hour + 1) if not weather_arg else {}
+    bike_ok = weather.get("bike_ok", True)
+    weather_context = weather_arg or weather.get("summary", "ясно")
     msg = await update.message.reply_text("⏳ Составляю тренировку...")
-    reply = ask_groq(data, f"Составь тренировку на сегодня ({weekday}), погода: {weather}. Ответь ТОЛЬКО чистым JSON workout.")
+    reply = ask_groq(data,
+        f"Составь тренировку на сегодня ({weekday}). Погода: {weather_context}. "
+        f"{'Велик можно.' if bike_ok else 'Велик НЕ берём — плохая погода.'} "
+        "Ответь ТОЛЬКО чистым JSON workout."
+    )
     w = parse_json(reply)
     if w and w.get("type") == "workout":
+        if not bike_ok:
+            w["bike"] = False
         data["pending_workout"] = w
         data["workout_accepted"] = False
         save_data(data)
-        await msg.edit_text(fmt_workout(w), parse_mode="Markdown", reply_markup=accept_kb())
+        weather_str = fmt_weather(weather, "сейчас") if weather else ""
+        text = (weather_str + "\n\n" + fmt_workout(w)) if weather_str else fmt_workout(w)
+        await msg.edit_text(text, parse_mode="Markdown", reply_markup=accept_kb())
     else:
         await msg.edit_text(reply)
 
@@ -581,34 +667,57 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 # ─── ПЛАНИРОВЩИК ──────────────────────────────────────────────────────────────
 async def job_wakeup(app: Application):
-    """6:30 — подъём"""
+    """6:30 — подъём с актуальной погодой"""
     data = load_data()
     w = data.get("pending_workout")
     accepted = data.get("workout_accepted", False)
 
+    # Погода на время тренировки (7:00)
+    weather = get_weather(target_hour=7)
+    weather_str = fmt_weather(weather, "тренировку")
+
     if w and not accepted:
-        # Напоминаем принять/отклонить
-        text = f"🌅 *6:30 — Подъём!* 💪\n\nВот твоё задание на сегодня:\n\n{fmt_workout(w)}"
+        text = f"🌅 *6:30 — Подъём!* 💪{weather_str}\n\nВот задание на сегодня:\n\n{fmt_workout(w)}"
         await app.bot.send_message(YOUR_CHAT_ID, text, parse_mode="Markdown", reply_markup=accept_kb())
     elif w and accepted:
-        text = f"🌅 *6:30 — Подъём!* 💪\n\nТы принял вызов — вперёд!\n\n{fmt_workout(w)}"
+        text = f"🌅 *6:30 — Подъём!* 💪{weather_str}\n\nТы принял вызов — вперёд!\n\n{fmt_workout(w)}"
         await app.bot.send_message(YOUR_CHAT_ID, text, parse_mode="Markdown")
     else:
-        await app.bot.send_message(YOUR_CHAT_ID, "🌅 *6:30 — Подъём!* Напиши /workout чтобы получить задание!", parse_mode="Markdown")
+        text = f"🌅 *6:30 — Подъём!* 💪{weather_str}\n\nНапиши /workout чтобы получить задание!"
+        await app.bot.send_message(YOUR_CHAT_ID, text, parse_mode="Markdown")
 
 async def job_evening(app: Application):
-    """20:00 — задание на завтра"""
+    """20:00 — задание на завтра с погодой"""
     data = load_data()
     tomorrow = (datetime.now(TIMEZONE) + timedelta(days=1)).strftime("%A")
-    reply = ask_groq(data, f"Составь тренировку на завтра ({tomorrow}). Учти все данные и психологию. Ответь ТОЛЬКО чистым JSON workout.")
+
+    # Проверяем погоду на утро (7:00)
+    weather = get_weather(target_hour=7)
+    bike_ok = weather.get("bike_ok", True)
+    weather_str = fmt_weather(weather, "завтрашнее утро")
+
+    weather_context = ""
+    if weather:
+        weather_context = (
+            f"Погода на завтра утром: {weather.get('summary', '')}. "
+            f"{'Велик брать можно — погода хорошая.' if bike_ok else 'Велик НЕ берём — плохая погода, дождь или сильный ветер.'} "
+        )
+
+    reply = ask_groq(data,
+        f"Составь тренировку на завтра ({tomorrow}). {weather_context}"
+        "Учти все данные и психологию. Ответь ТОЛЬКО чистым JSON workout."
+    )
     w = parse_json(reply)
     if w and w.get("type") == "workout":
+        # Если погода плохая — принудительно убираем велик
+        if not bike_ok:
+            w["bike"] = False
         data["pending_workout"] = w
         data["workout_accepted"] = False
         save_data(data)
         await app.bot.send_message(
             YOUR_CHAT_ID,
-            f"🌙 *Задание на завтра:*\n\n{fmt_workout(w)}",
+            f"🌙 *Задание на завтра:*{weather_str}\n\n{fmt_workout(w)}",
             parse_mode="Markdown",
             reply_markup=accept_kb()
         )
