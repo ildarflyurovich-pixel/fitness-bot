@@ -596,10 +596,13 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     elif q.data == "accept":
         data["workout_accepted"] = True
-        reply = ask_groq(data, "Принял тренировку! Скажи мотивирующее, 1 предложение. Без JSON.")
         save_data(data)
         await q.edit_message_reply_markup(None)
-        await q.message.reply_text(f"🔥 {reply}\n\nКогда закончишь — /done")
+        await q.message.reply_text(
+            "🔥 *Принято! Вперёд!*\n\n"
+            "Когда закончишь — напиши /done и прикрепи скрин тренировки 📷",
+            parse_mode="Markdown"
+        )
 
     elif q.data == "suggest":
         await q.edit_message_reply_markup(None)
@@ -629,6 +632,8 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     elif q.data == "more_equipment":
         await q.edit_message_reply_markup(None)
         await q.message.reply_text("📷 Скидывай следующее фото тренажёра!")
+
+    elif q.data == "skip_today":
         data["streak"] = 0
         week = get_week_key()
         data.setdefault("weekly_stats", {}).setdefault(week, {"done":0,"skipped":0,"total_km":0})["skipped"] += 1
@@ -643,55 +648,95 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     data = load_data()
     text = update.message.text
+    lower = text.lower()
 
     # Запоминаем предпочтения
-    lower = text.lower()
     prefs = data.setdefault("preferences", [])
     for kw in ["не люблю", "терпеть не могу", "обожаю", "люблю", "предпочитаю"]:
         if kw in lower and len(text) < 100:
             if text not in prefs:
                 prefs.append(text)
 
-    reply = ask_groq(data, text)
+    # Если пользователь говорит о завтрашних планах — запоминаем и отвечаем словами
+    tomorrow_hints = ["завтра", "хочу побегать", "хочу бег", "хочу на площадку",
+                      "хочу велик", "планирую", "собираюсь"]
+    is_tomorrow_wish = any(h in lower for h in tomorrow_hints)
+
+    if is_tomorrow_wish:
+        # Сохраняем пожелание на завтра
+        data.setdefault("tomorrow_wishes", []).append(text)
+        save_data(data)
+        # Отвечаем разговорно — без тренировки
+        reply = ask_groq(data,
+            f"Пользователь говорит о планах: '{text}'. "
+            "Ответь тепло и коротко — запомни пожелание, скажи что учтёшь в вечернем задании в 20:00. "
+            "НЕ присылай тренировку. Просто поговори. Без JSON."
+        )
+        save_data(data)
+        await update.message.reply_text(reply)
+        return
+
+    # Обычный разговор — отвечаем текстом, без тренировок
+    reply = ask_groq(data,
+        f"Пользователь пишет: '{text}'. "
+        "Ответь как тренер — коротко, по делу. "
+        "НЕ присылай тренировку если не просит явно (/workout). Без JSON."
+    )
+    save_data(data)
+
+    # Если всё же пришёл JSON тренировки (явно попросил) — показываем только информационно
     w = parse_json(reply)
     if w and w.get("type") == "workout":
-        data["pending_workout"] = w
-        data["workout_accepted"] = False
-        save_data(data)
-        await update.message.reply_text(fmt_workout(w), parse_mode="Markdown", reply_markup=accept_kb())
-    elif w and w.get("type") == "run_result":
-        # Вдруг прислал текст с данными — тоже обрабатываем
-        await update.message.reply_text("Используй /done чтобы отметить тренировку, или скинь скрин пробежки 📷")
+        await update.message.reply_text(
+            "Вот что я планирую для тебя — но финальное задание пришлю в 20:00:\n\n" +
+            fmt_workout(w),
+            parse_mode="Markdown"
+        )
     else:
         await update.message.reply_text(reply)
 
 # ─── ПЛАНИРОВЩИК ──────────────────────────────────────────────────────────────
 async def job_wakeup(app: Application):
-    """6:30 — подъём с актуальной погодой"""
+    """6:30 — подъём! Здесь кнопки принятия тренировки"""
     data = load_data()
     w = data.get("pending_workout")
     accepted = data.get("workout_accepted", False)
 
-    # Погода на время тренировки (7:00)
     weather = get_weather(target_hour=7)
-    weather_str = fmt_weather(weather, "тренировку")
+    weather_str = fmt_weather(weather, "сегодня")
 
-    if w and not accepted:
-        text = f"🌅 *6:30 — Подъём!* 💪{weather_str}\n\nВот задание на сегодня:\n\n{fmt_workout(w)}"
-        await app.bot.send_message(YOUR_CHAT_ID, text, parse_mode="Markdown", reply_markup=accept_kb())
-    elif w and accepted:
-        text = f"🌅 *6:30 — Подъём!* 💪{weather_str}\n\nТы принял вызов — вперёд!\n\n{fmt_workout(w)}"
+    if accepted:
+        # Уже принял вечером — просто напоминаем
+        text = (
+            f"🌅 *6:30 — Подъём!* 💪{weather_str}\n\n"
+            f"Ты уже принял тренировку — вперёд!\n\n"
+            f"{fmt_workout(w) if w else ''}\n\n"
+            f"Когда закончишь — /done и скрин тренировки 📷"
+        )
         await app.bot.send_message(YOUR_CHAT_ID, text, parse_mode="Markdown")
+
+    elif w:
+        # Не принял — показываем с кнопками
+        text = (
+            f"🌅 *6:30 — Подъём!* 💪{weather_str}\n\n"
+            f"Вот твоё задание на сегодня:\n\n"
+            f"{fmt_workout(w)}"
+        )
+        await app.bot.send_message(
+            YOUR_CHAT_ID, text,
+            parse_mode="Markdown",
+            reply_markup=accept_kb()
+        )
+
     else:
         text = f"🌅 *6:30 — Подъём!* 💪{weather_str}\n\nНапиши /workout чтобы получить задание!"
         await app.bot.send_message(YOUR_CHAT_ID, text, parse_mode="Markdown")
 
 async def job_evening(app: Application):
-    """20:00 — задание на завтра с погодой"""
+    """20:00 — план на завтра (информационно, без кнопок принятия)"""
     data = load_data()
     tomorrow = (datetime.now(TIMEZONE) + timedelta(days=1)).strftime("%A")
 
-    # Проверяем погоду на утро (7:00)
     weather = get_weather(target_hour=7)
     bike_ok = weather.get("bike_ok", True)
     weather_str = fmt_weather(weather, "завтрашнее утро")
@@ -700,26 +745,39 @@ async def job_evening(app: Application):
     if weather:
         weather_context = (
             f"Погода на завтра утром: {weather.get('summary', '')}. "
-            f"{'Велик брать можно — погода хорошая.' if bike_ok else 'Велик НЕ берём — плохая погода, дождь или сильный ветер.'} "
+            f"{'Велик берём.' if bike_ok else 'Велик НЕ берём — плохая погода.'} "
         )
 
+    # Учитываем пожелания пользователя за день
+    wishes = data.get("tomorrow_wishes", [])
+    wishes_context = ""
+    if wishes:
+        wishes_context = f"Пожелания пользователя на завтра: {'; '.join(wishes[-3:])}. Обязательно учти их. "
+        data["tomorrow_wishes"] = []  # сбрасываем после учёта
+
     reply = ask_groq(data,
-        f"Составь тренировку на завтра ({tomorrow}). {weather_context}"
+        f"Составь план тренировки на завтра ({tomorrow}). {weather_context}{wishes_context}"
         "Учти все данные и психологию. Ответь ТОЛЬКО чистым JSON workout."
     )
     w = parse_json(reply)
     if w and w.get("type") == "workout":
-        # Если погода плохая — принудительно убираем велик
         if not bike_ok:
             w["bike"] = False
         data["pending_workout"] = w
         data["workout_accepted"] = False
         save_data(data)
+
+        # Вечером — только информация, кнопка только "Изменить пожелания"
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton("💬 Хочу изменить", callback_data="suggest"),
+        ]])
         await app.bot.send_message(
             YOUR_CHAT_ID,
-            f"🌙 *Задание на завтра:*{weather_str}\n\n{fmt_workout(w)}",
+            f"🌙 *План на завтра:*{weather_str}\n\n"
+            f"{fmt_workout(w)}\n\n"
+            f"_Утром в 6:30 пришлю напоминание — тогда примешь или отклонишь._",
             parse_mode="Markdown",
-            reply_markup=accept_kb()
+            reply_markup=keyboard
         )
 
 async def job_motivation(app: Application):
