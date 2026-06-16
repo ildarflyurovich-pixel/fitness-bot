@@ -217,7 +217,13 @@ def ask_groq(data: dict, user_message: str, image_bytes: bytes = None, audio_byt
                     {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}}
                 ]}
             ]
-            resp = client.chat.completions.create(model=VISION_MODEL, messages=messages, max_tokens=800, temperature=0.1)
+            resp = client.chat.completions.create(
+                model=VISION_MODEL,
+                messages=messages,
+                max_tokens=800,
+                temperature=0.1,
+                timeout=30
+            )
         else:
             history = data.get("chat_history", [])[-30:]
             messages = (
@@ -678,14 +684,88 @@ async def cmd_profile(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def on_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.id != YOUR_CHAT_ID:
         return
-    caption = (update.message.caption or "").lower()
     msg = await update.message.reply_text("📷 Смотрю...")
-    photo = update.message.photo[-1]
-    file = await ctx.bot.get_file(photo.file_id)
-    img_bytes = bytes(await file.download_as_bytearray())
-    data = load_data()
-    reply = ask_groq(data, "фото", img_bytes)
-    result = parse_json(reply)
+    try:
+        photo = update.message.photo[-1]
+        file = await ctx.bot.get_file(photo.file_id)
+        img_bytes = bytes(await file.download_as_bytearray())
+        data = load_data()
+        reply = ask_groq(data, "фото", img_bytes)
+        result = parse_json(reply)
+    except Exception as e:
+        log.error(f"Photo error: {e}")
+        await msg.edit_text("⚠️ Не смог обработать фото. Попробуй ещё раз или скинь другое фото.")
+        return
+
+    if result and result.get("type") == "run_result":
+        record = {"timestamp": datetime.now(TIMEZONE).isoformat(),
+                  **{k:v for k,v in result.items() if k != "type"}}
+        data.setdefault("runs", []).append(record)
+        km = result.get("distance_km", 0)
+        is_record = False
+        if km:
+            is_record = add_km(data, km)
+            data.setdefault("weekly_stats", {}).setdefault(get_week_key(), {"done":0,"skipped":0,"total_km":0})["done"] += 1
+        update_streak(data)
+        update_preferred_time(data, result.get("start_time", ""))
+        new_ach = check_achievements(data)
+        save_data(data)
+        text = fmt_run(record)
+        if is_record:
+            text += f"\n\n🏆 *Новый рекорд — {km} км!*"
+        if new_ach:
+            text += "\n\n" + "\n".join(new_ach)
+        text += "\n\n*Как оцениваешь сложность?*"
+        await msg.edit_text(text, parse_mode="Markdown", reply_markup=rating_kb())
+
+    elif result and result.get("type") == "equipment":
+        eq = result
+        name = eq.get("name", "Тренажёр")
+        equipment_list = data.setdefault("equipment", [])
+        is_new = name not in [e.get("name") for e in equipment_list]
+        if is_new:
+            equipment_list.append({"name": name, "muscle_group": eq.get("muscle_group",""),
+                                   "sets_reps": eq.get("sets_reps","4×12"), "note": eq.get("note","")})
+            save_data(data)
+        text = (
+            f"💪 *{name}*\n\n"
+            f"🎯 {eq.get('muscle_group','')}\n"
+            f"📋 {eq.get('how_to_use','')}\n"
+            f"🔢 {eq.get('sets_reps','')}\n"
+        )
+        if eq.get("note"):
+            text += f"💡 _{eq['note']}_\n"
+        text += f"\n{'✅ Добавил в арсенал!' if is_new else '_Уже в программе_'}"
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton("📋 Перестроить тренировку", callback_data="rebuild_workout"),
+            InlineKeyboardButton("➕ Ещё тренажёр", callback_data="more_equipment"),
+        ]])
+        await msg.edit_text(text, parse_mode="Markdown", reply_markup=keyboard)
+
+    elif result and result.get("type") == "food":
+        record = {"timestamp": datetime.now(TIMEZONE).isoformat(),
+                  **{k:v for k,v in result.items() if k != "type"}}
+        data.setdefault("food_log", []).append(record)
+        today = datetime.now(TIMEZONE).strftime("%Y-%m-%d")
+        today_cal = sum(
+            f.get("calories", 0) for f in data["food_log"]
+            if f.get("timestamp", "")[:10] == today
+        )
+        save_data(data)
+        text = fmt_food(result) + f"\n\n📊 _Калорий сегодня: ~{today_cal} ккал_"
+        await msg.edit_text(text, parse_mode="Markdown")
+
+    else:
+        # Groq не вернул JSON — спрашиваем уточнение
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton("🏃 Пробежка/велик", callback_data="photo_run"),
+            InlineKeyboardButton("💪 Тренажёр", callback_data="photo_equipment"),
+            InlineKeyboardButton("🍽 Еда", callback_data="photo_food"),
+        ]])
+        await msg.edit_text(
+            "Не смог распознать автоматически. Что на фото?",
+            reply_markup=keyboard
+        )
 
     if result and result.get("type") == "run_result":
         record = {"timestamp": datetime.now(TIMEZONE).isoformat(),
@@ -816,6 +896,18 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         save_data(data)
         await q.edit_message_reply_markup(None)
         await q.message.reply_text(reply)
+
+    elif q.data == "photo_run":
+        await q.edit_message_reply_markup(None)
+        await q.message.reply_text("Окей, введи данные вручную:\n/done — если выполнил тренировку\nИли напиши дистанцию и время, например: 'пробежал 5 км за 28 минут'")
+
+    elif q.data == "photo_equipment":
+        await q.edit_message_reply_markup(None)
+        await q.message.reply_text("Напиши название тренажёра — добавлю в программу!")
+
+    elif q.data == "photo_food":
+        await q.edit_message_reply_markup(None)
+        await q.message.reply_text("Напиши что ел — оценю примерно!")
 
     elif q.data == "rebuild_workout":
         equipment = data.get("equipment", [])
