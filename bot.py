@@ -1,6 +1,9 @@
 import os, json, logging, base64, urllib.request, urllib.parse, csv, io
 from datetime import datetime, timedelta
 from pathlib import Path
+from PIL import Image
+from pillow_heif import register_heif_opener
+register_heif_opener()  # поддержка HEIC от iPhone
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -28,7 +31,7 @@ log = logging.getLogger(__name__)
 client = Groq(api_key=GROQ_API_KEY)
 
 TEXT_MODEL   = "llama-3.3-70b-versatile"
-VISION_MODEL = "llama-3.2-11b-vision-preview"
+VISION_MODEL = "llama-3.2-90b-vision-preview"  # более мощная модель
 AUDIO_MODEL  = "whisper-large-v3"
 
 SYSTEM = """Ты — Макс, личный тренер. Говоришь ТОЛЬКО на русском языке. Никаких слов на английском, испанском или любом другом языке — только русский. На "ты", кратко и по делу.
@@ -206,15 +209,15 @@ def ask_groq(data: dict, user_message: str, image_bytes: bytes = None, audio_byt
             log.info(f"Voice transcribed: {user_message}")
 
         if image_bytes:
-            b64 = base64.b64encode(image_bytes).decode("utf-8")
+            b64 = prepare_image(image_bytes)
             messages = [
                 {"role": "system", "content": SYSTEM},
                 {"role": "user", "content": [
-                    {"type": "text", "text": f"{ctx}\nПосмотри на фото. Если скрин пробежки — JSON run_result. Если тренажёр/снаряд — JSON equipment. Если еда — JSON food. Ответь ТОЛЬКО чистым JSON."},
+                    {"type": "text", "text": f"{ctx}\nПосмотри на фото. Если скрин пробежки или велопробежки — JSON run_result. Если тренажёр/снаряд на улице — JSON equipment. Если еда — JSON food. Ответь ТОЛЬКО чистым JSON без markdown."},
                     {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}}
                 ]}
             ]
-            resp = client.chat.completions.create(model=VISION_MODEL, messages=messages, max_tokens=600, temperature=0.1)
+            resp = client.chat.completions.create(model=VISION_MODEL, messages=messages, max_tokens=800, temperature=0.1)
         else:
             history = data.get("chat_history", [])[-30:]
             messages = (
@@ -236,7 +239,24 @@ def ask_groq(data: dict, user_message: str, image_bytes: bytes = None, audio_byt
         log.error(f"Groq error: {e}")
         return "Что-то пошло не так, попробуй ещё раз."
 
-def parse_json(text: str) -> dict | None:
+def prepare_image(image_bytes: bytes) -> str:
+    """Конвертирует любое фото (включая HEIC) в base64 JPEG для Groq."""
+    try:
+        img = Image.open(io.BytesIO(image_bytes))
+        # Конвертируем в RGB если нужно (HEIC может быть RGBA)
+        if img.mode not in ("RGB", "L"):
+            img = img.convert("RGB")
+        # Уменьшаем если слишком большое (Groq лимит)
+        max_size = 1280
+        if max(img.size) > max_size:
+            img.thumbnail((max_size, max_size), Image.LANCZOS)
+        # Сохраняем как JPEG
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=85)
+        return base64.b64encode(buf.getvalue()).decode("utf-8")
+    except Exception as e:
+        log.error(f"Image conversion error: {e}")
+        return base64.b64encode(image_bytes).decode("utf-8")
     try:
         s = text.find("{"); e = text.rfind("}") + 1
         if s >= 0 and e > s:
