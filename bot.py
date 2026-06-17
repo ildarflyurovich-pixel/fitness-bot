@@ -1,1182 +1,744 @@
-import os, json, logging, base64, urllib.request, urllib.parse, csv, io
+"""Тренер Макс v4.0 — надёжный, умный, без компромиссов"""
+import os, json, logging, base64, urllib.request, urllib.parse, csv, io, threading, re
 from datetime import datetime, timedelta
 from pathlib import Path
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from PIL import Image
 from pillow_heif import register_heif_opener
-register_heif_opener()  # поддержка HEIC от iPhone
+register_heif_opener()
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import (
-    Application, CommandHandler, MessageHandler,
-    CallbackQueryHandler, ContextTypes, filters
-)
+from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from groq import Groq
 import pytz
 
+# ─── CONFIG ───────────────────────────────────────────────────────────────────
 TELEGRAM_TOKEN  = os.environ["TELEGRAM_TOKEN"]
 GROQ_API_KEY    = os.environ["GROQ_API_KEY"]
 YOUR_CHAT_ID    = int(os.environ["YOUR_CHAT_ID"])
 TIMEZONE        = pytz.timezone(os.environ.get("TZ", "Asia/Yekaterinburg"))
 WEATHER_API_KEY = os.environ.get("WEATHER_API_KEY", "")
 CITY            = os.environ.get("CITY", "Yekaterinburg")
+PORT            = int(os.environ.get("PORT", 8080))
 
 DATA_FILE = Path("data.json")
-logging.basicConfig(
-    level=logging.INFO,
+logging.basicConfig(level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s",
-    handlers=[logging.FileHandler("bot.log"), logging.StreamHandler()]
-)
+    handlers=[logging.FileHandler("bot.log"), logging.StreamHandler()])
 log = logging.getLogger(__name__)
-client = Groq(api_key=GROQ_API_KEY)
+groq = Groq(api_key=GROQ_API_KEY)
 
 TEXT_MODEL   = "llama-3.3-70b-versatile"
-VISION_MODEL = "llama-3.2-90b-vision-preview"  # более мощная модель
+VISION_MODEL = "llama-3.2-90b-vision-preview"
 AUDIO_MODEL  = "whisper-large-v3"
 
-SYSTEM = """Ты — Макс, личный тренер. Говоришь ТОЛЬКО на русском языке. Никаких слов на английском, испанском или любом другом языке — только русский. На "ты", кратко и по делу.
+# ─── KEEP ALIVE (Railway не убьёт процесс) ────────────────────────────────────
+class Health(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200); self.end_headers()
+        self.wfile.write(b"Max Trainer OK")
+    def log_message(self, *a): pass
 
-═══ ПРОФИЛЬ ═══
-Рост 172 см, вес начальный 94 кг → цель 80 кг (рельеф без объёма, кроссфит-стиль)
-Бег: прогрессия от 3 км → цель 10 км регулярно
-Площадка: воркаут + уличные тренажёры (турники, брусья, тренажёры с весом)
-Велосипед: 2.5 км от дома до площадки
-В зал не ходит
-Подтягивания тяжело → начинаем с австралийских и негативов. Брусья легко.
+threading.Thread(target=lambda: HTTPServer(("0.0.0.0", PORT), Health).serve_forever(), daemon=True).start()
 
-═══ ТИПЫ ТРЕНИРОВОК ═══
-1. ВЕЛИК + ПЛОЩАДКА: велик туда (2.5 км) → тренировка 40-60 мин → велик домой. Минимум 4 упр × 4 подхода + финишёр 10-15 мин. БЕГ в этот день не добавляем.
-2. ТОЛЬКО БЕГ: выходит из дома, бежит. Прогрессия +0.5 км каждые 1-2 недели.
-3. АКТИВНЫЙ ОТДЫХ: лёгкая прогулка или велик без нагрузки.
+# ─── СИСТЕМНЫЙ ПРОМПТ ─────────────────────────────────────────────────────────
+SYSTEM = """Ты — Макс, личный тренер. ТОЛЬКО русский язык. На "ты". Кратко, по делу, без воды.
 
-═══ ПРАВИЛА ═══
-1. Никогда: велик туда + бег обратно
-2. Площадка = полноценная тренировка, не 3 упражнения
-3. Финишёр всегда в конце (берпи, AMRAP, табата)
-4. Чередуй тяжёлый/лёгкий день
-5. Бот не должен надоедать — только по делу
-6. Запоминай всё что говорит пользователь о предпочтениях
+ПРОФИЛЬ ПОЛЬЗОВАТЕЛЯ:
+Рост 172, вес 94 кг → цель 80 кг. Рельеф без объёма. Кроссфит-стиль.
+Бег: сейчас 3-5 км → цель 10 км. +0.5 км каждые 1-2 недели.
+Площадка FOREMAN: турники, брусья, тяга горизонтальная, гиперэкстензия, жим ногами, наклонная скамья для пресса, наклонная скамья для жима, шведская стенка, горизонтальная лестница.
+Велосипед: 2.5 км до площадки (разминка) и 2.5 км домой (заминка).
+В зал не ходит.
 
-═══ ФОРМАТЫ JSON ═══
-Тренировка: {"type":"workout","title":"...","bike":true,"plan":[{"exercise":"...","sets":4,"reps":"12","note":"..."}],"motivation":"...","estimated_time":"50 мин","difficulty_target":3}
-Пробежка: {"type":"run_result","distance_km":5.2,"duration":"28:14","pace_avg":"5:26/км","start_time":"07:15","finish_time":"07:43","calories":420,"app":"Strava","insight":"..."}
-Тренажёр: {"type":"equipment","name":"...","muscle_group":"...","how_to_use":"...","sets_reps":"4×12","note":"..."}
-Еда: {"type":"food","name":"...","calories":450,"protein":30,"carbs":40,"fat":15,"assessment":"хорошо/норм/плохо","comment":"..."}
-Самочувствие: {"type":"feeling","energy":4,"muscles_ok":true,"pain":"нет/колено/спина","comment":"..."}
+3 ТИПА ТРЕНИРОВОК:
+1. ВЕЛИК+ПЛОЩАДКА: велик туда → 40-60 мин (5+ упр × 4-5 подходов + финишёр 10-15 мин) → велик домой. БЕГ в этот день не нужен.
+2. ТОЛЬКО БЕГ: выходит и бежит. Прогрессия дистанции.
+3. ОТДЫХ: лёгкая прогулка.
 
-Для обычного разговора — только текст, без JSON."""
+ЗАПРЕЩЕНО: велик туда + бег обратно. Тренировка из 3 упражнений по 3 подхода.
+Финишёр обязателен: берпи / AMRAP / табата / спринты.
+
+АДАПТАЦИЯ ПО ОЦЕНКАМ: 1-2 → легче или так же. 3 → +10% нагрузки. 4-5 → держи темп или восстановление.
+
+JSON ФОРМАТЫ (без markdown):
+workout: {"type":"workout","title":"...","bike":true,"plan":[{"exercise":"...","sets":4,"reps":"12","note":"..."}],"motivation":"...","estimated_time":"50 мин","difficulty_target":3}
+run_result: {"type":"run_result","distance_km":5.2,"duration":"28:14","pace_avg":"5:26/км","start_time":"07:15","finish_time":"07:43","calories":420,"app":"...","insight":"..."}
+equipment: {"type":"equipment","name":"...","muscle_group":"...","how_to_use":"...","sets_reps":"4×12"}
+food: {"type":"food","name":"...","calories":450,"protein":30,"carbs":40,"fat":15,"assessment":"хорошо/норм/плохо","comment":"..."}
+
+Для разговора — только текст."""
 
 # ─── ДАННЫЕ ───────────────────────────────────────────────────────────────────
-def load_data() -> dict:
+DEFAULT_EQUIPMENT = [
+    {"name":"Турник высокий","muscle_group":"Широчайшие, бицепс","sets_reps":"5×макс"},
+    {"name":"Брусья параллельные","muscle_group":"Грудь, трицепс","sets_reps":"5×12"},
+    {"name":"Тяга горизонтальная","muscle_group":"Широчайшие, бицепс","sets_reps":"4×12"},
+    {"name":"Наклонная скамья для пресса","muscle_group":"Пресс","sets_reps":"4×15"},
+    {"name":"Наклонная скамья для жима","muscle_group":"Верхняя грудь, плечи","sets_reps":"4×12"},
+    {"name":"Гиперэкстензия","muscle_group":"Поясница, ягодицы","sets_reps":"4×15"},
+    {"name":"Жим ногами лёжа","muscle_group":"Квадрицепс, ягодицы","sets_reps":"4×12"},
+    {"name":"Шведская стенка","muscle_group":"Пресс, сгибатели бедра","sets_reps":"3×15"},
+    {"name":"Горизонтальная лестница","muscle_group":"Хват, широчайшие","sets_reps":"3×проход"},
+]
+
+def load() -> dict:
     if DATA_FILE.exists():
-        return json.loads(DATA_FILE.read_text(encoding="utf-8"))
+        try: return json.loads(DATA_FILE.read_text(encoding="utf-8"))
+        except: pass
     return {
-        "chat_history": [],
-        "runs": [],
-        "food_log": [],
-        "feeling_log": [],
-        "weekly_stats": {},
-        "monthly_km": {},
-        "weight_log": [{"date": datetime.now(TIMEZONE).strftime("%Y-%m-%d"), "weight": 94}],
-        "pending_workout": None,
-        "workout_accepted": False,
-        "last_run_km": 3.0,
-        "streak": 0,
-        "last_workout_date": None,
-        "preferences": [],
-        "tomorrow_wishes": [],
-        "equipment": [],
-        "records": {"max_run_km": 0, "max_pullups": 0, "min_weight": 94},
-        "challenges": [],
-        "achievements": [],
-        "psychology": {
-            "all_start_times": [],
-            "preferred_time": None,
-            "avg_rating": [],
-            "skip_patterns": [],
-        }
+        "history": [], "runs": [], "food_log": [], "feeling_log": [],
+        "weekly": {}, "monthly_km": {},
+        "weight_log": [{"date": today_str(), "weight": 94}],
+        "pending": None, "accepted": False,
+        "last_run_km": 3.0, "streak": 0, "last_date": None,
+        "prefs": [], "wishes": [],
+        "equipment": DEFAULT_EQUIPMENT,
+        "records": {"run": 0, "streak": 0, "min_weight": 94},
+        "challenges": [], "achievements": [],
+        "psych": {"times": [], "preferred": None, "ratings": [], "skips": []},
     }
 
-def save_data(d: dict):
-    DATA_FILE.write_text(json.dumps(d, ensure_ascii=False, indent=2), encoding="utf-8")
+def save(d: dict):
+    try: DATA_FILE.write_text(json.dumps(d, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception as e: log.error(f"Save: {e}")
 
-def get_week_key() -> str:
-    today = datetime.now(TIMEZONE)
-    return (today - timedelta(days=today.weekday())).strftime("%Y-%W")
+def today_str(): return datetime.now(TIMEZONE).strftime("%Y-%m-%d")
+def week_key():
+    t = datetime.now(TIMEZONE); return (t - timedelta(days=t.weekday())).strftime("%Y-%W")
+def month_key(): return datetime.now(TIMEZONE).strftime("%Y-%m")
 
-def get_month_key() -> str:
-    return datetime.now(TIMEZONE).strftime("%Y-%m")
-
-def build_context(data: dict) -> str:
-    runs = data.get("runs", [])
-    psych = data.get("psychology", {})
-    w = data.get("weekly_stats", {}).get(get_week_key(), {})
-    weight_log = data.get("weight_log", [])
-    prefs = data.get("preferences", [])
-    monthly = data.get("monthly_km", {}).get(get_month_key(), 0)
-    records = data.get("records", {})
-    feeling_log = data.get("feeling_log", [])
-
-    parts = ["[ДАННЫЕ:"]
-    parts.append(f"бег {data['last_run_km']} км | серия {data.get('streak',0)} дней")
-    if weight_log:
-        lw = weight_log[-1]
-        parts.append(f"| вес {lw.get('weight',94)} кг (цель 80, осталось {lw.get('weight',94)-80} кг)")
-    if runs:
-        r = runs[-1]
-        parts.append(f"| последний бег: {r.get('distance_km')} км темп {r.get('pace_avg','?')}")
-    if w:
-        parts.append(f"| неделя: {w.get('done',0)} тр. {w.get('total_km',0):.1f} км")
-    if monthly:
-        parts.append(f"| месяц: {monthly:.1f} км")
-    if records.get("max_run_km"):
-        parts.append(f"| рекорд бега: {records['max_run_km']} км")
-    if feeling_log:
-        lf = feeling_log[-1]
-        parts.append(f"| самочувствие: энергия {lf.get('energy',3)}/5 боль {lf.get('pain','нет')}")
-    if psych.get("avg_rating"):
-        avg = sum(psych["avg_rating"][-5:]) / len(psych["avg_rating"][-5:])
-        parts.append(f"| средняя оценка: {avg:.1f}/5")
-    if prefs:
-        parts.append(f"| предпочтения: {'; '.join(prefs[-3:])}")
+def ctx(d: dict) -> str:
+    r = d.get("records", {}); p = d.get("psych", {})
+    w = d.get("weekly", {}).get(week_key(), {}); wl = d.get("weight_log", [{}])
+    fl = d.get("feeling_log", [])
+    parts = [f"[бег {d['last_run_km']} км | серия {d.get('streak',0)} дн."]
+    if wl: parts.append(f"| вес {wl[-1].get('weight',94)} кг (до цели {wl[-1].get('weight',94)-80:.1f} кг)")
+    runs = d.get("runs", [])
+    if runs: parts.append(f"| последний бег {runs[-1].get('distance_km','?')} км")
+    if w: parts.append(f"| неделя: {w.get('done',0)} тр. {w.get('km',0):.1f} км")
+    if r.get("run"): parts.append(f"| рекорд {r['run']} км")
+    if fl:
+        lf = fl[-1]
+        if lf.get("pain") and "нет" not in str(lf.get("pain","")): parts.append(f"| БОЛЬ: {lf['pain']} — избегай!")
+    if p.get("ratings") and len(p["ratings"]) >= 2:
+        avg = sum(p["ratings"][-5:]) / min(len(p["ratings"]),5)
+        parts.append(f"| средняя оценка {avg:.1f}/5")
+    if p.get("preferred"): parts.append(f"| выходит обычно: {p['preferred']}")
+    wishes = d.get("wishes", [])
+    if wishes: parts.append(f"| пожелания: {'; '.join(wishes[-2:])}")
+    eq = [e["name"] for e in d.get("equipment", [])]
+    if eq: parts.append(f"| тренажёры: {', '.join(eq)}")
+    if d.get("prefs"): parts.append(f"| предпочтения: {'; '.join(d['prefs'][-3:])}")
     parts.append("]")
     return " ".join(parts)
 
 # ─── ПОГОДА ───────────────────────────────────────────────────────────────────
-def get_weather(target_hour: int = 7) -> dict:
-    if not WEATHER_API_KEY:
-        return {}
+def weather(hour: int = 7) -> dict:
+    if not WEATHER_API_KEY: return {}
     try:
-        url = (
-            f"https://api.openweathermap.org/data/2.5/forecast"
-            f"?q={urllib.parse.quote(CITY)}&appid={WEATHER_API_KEY}"
-            f"&units=metric&lang=ru&cnt=16"
-        )
-        with urllib.request.urlopen(url, timeout=5) as resp:
-            data = json.loads(resp.read())
-        tomorrow = (datetime.now(TIMEZONE) + timedelta(days=1)).strftime("%Y-%m-%d")
-        best, best_diff = None, 999
-        for item in data.get("list", []):
-            dt_txt = item.get("dt_txt", "")
-            if not dt_txt.startswith(tomorrow):
-                continue
-            diff = abs(int(dt_txt[11:13]) - target_hour)
-            if diff < best_diff:
-                best_diff, best = diff, item
-        if not best:
-            return {}
-        main = best["main"]
-        wind = best.get("wind", {})
-        rain = best.get("rain", {}).get("3h", 0)
-        snow = best.get("snow", {}).get("3h", 0)
+        url = f"https://api.openweathermap.org/data/2.5/forecast?q={urllib.parse.quote(CITY)}&appid={WEATHER_API_KEY}&units=metric&lang=ru&cnt=16"
+        with urllib.request.urlopen(url, timeout=5) as r: raw = json.loads(r.read())
+        tom = (datetime.now(TIMEZONE) + timedelta(days=1)).strftime("%Y-%m-%d")
+        best, bd = None, 999
+        for it in raw.get("list", []):
+            dt = it.get("dt_txt","")
+            if not dt.startswith(tom): continue
+            d = abs(int(dt[11:13]) - hour)
+            if d < bd: bd, best = d, it
+        if not best: return {}
+        m = best["main"]; wnd = best.get("wind",{}); rain = best.get("rain",{}).get("3h",0); snow = best.get("snow",{}).get("3h",0)
         desc = best["weather"][0]["description"] if best.get("weather") else ""
-        temp = round(main.get("temp", 0))
-        feels = round(main.get("feels_like", 0))
-        speed = round(wind.get("speed", 0))
-        is_bad = rain > 0.5 or snow > 0 or speed > 10
-        emoji = ("🌧" if rain > 0.5 else "❄️" if snow > 0 else "💨" if speed > 10
-                 else "⛅" if "облач" in desc else "☀️")
-        return {
-            "temp": temp, "feels": feels, "desc": desc,
-            "wind_speed": speed, "rain": rain, "snow": snow,
-            "is_bad": is_bad, "emoji": emoji, "bike_ok": not is_bad,
-            "summary": f"{emoji} {temp}°C, {desc}, ветер {speed} м/с" + (f", дождь {rain} мм" if rain else ""),
-        }
-    except Exception as e:
-        log.warning(f"Weather error: {e}")
-        return {}
+        temp = round(m.get("temp",0)); feels = round(m.get("feels_like",0)); spd = round(wnd.get("speed",0))
+        bad = rain > 0.5 or snow > 0 or spd > 10
+        em = "🌧" if rain > 0.5 else "❄️" if snow else "💨" if spd > 10 else "⛅" if "облач" in desc else "☀️"
+        return {"temp":temp,"feels":feels,"desc":desc,"speed":spd,"rain":rain,"bad":bad,"bike":not bad,
+                "summary":f"{em} {temp}°C, {desc}, ветер {spd} м/с" + (f", дождь {rain:.1f}мм" if rain else "")}
+    except Exception as e: log.warning(f"Weather: {e}"); return {}
 
-def fmt_weather(w: dict, context: str = "утро") -> str:
-    if not w:
-        return ""
-    lines = [f"\n🌤 *Погода на {context}:* {w['summary']}"]
-    if w.get("feels") and abs(w["feels"] - w["temp"]) > 2:
-        lines.append(f"   _↳ Ощущается как {w['feels']}°C_")
-    lines.append("   _↳ " + ("Велик не берём 🚫" if w.get("is_bad") else "Велик берём! 🚴_"))
+def fmt_w(w: dict, ctx_str="утро") -> str:
+    if not w: return ""
+    lines = [f"\n🌤 *Погода на {ctx_str}:* {w['summary']}"]
+    if abs(w.get("feels",0) - w.get("temp",0)) > 2: lines.append(f"   _↳ Ощущается {w['feels']}°C_")
+    lines.append("   _↳ " + ("Велик не берём 🚫" if w.get("bad") else "Велик берём! 🚴_"))
     return "\n".join(lines)
 
-# ─── GROQ ─────────────────────────────────────────────────────────────────────
-def ask_groq(data: dict, user_message: str, image_bytes: bytes = None, audio_bytes: bytes = None) -> str:
-    ctx = build_context(data)
+# ─── ИЗОБРАЖЕНИЯ ──────────────────────────────────────────────────────────────
+def img_to_b64(img_bytes: bytes, max_px=800) -> str:
     try:
-        if audio_bytes:
-            transcription = client.audio.transcriptions.create(
-                file=("voice.ogg", audio_bytes, "audio/ogg"),
-                model=AUDIO_MODEL,
-                language="ru"
-            )
-            user_message = transcription.text
-            log.info(f"Voice transcribed: {user_message}")
+        img = Image.open(io.BytesIO(img_bytes))
+        if img.mode not in ("RGB","L"): img = img.convert("RGB")
+        if max(img.size) > max_px: img.thumbnail((max_px,max_px), Image.LANCZOS)
+        buf = io.BytesIO(); img.save(buf, "JPEG", quality=80)
+        return base64.b64encode(buf.getvalue()).decode()
+    except Exception as e: log.error(f"img_to_b64: {e}"); return base64.b64encode(img_bytes).decode()
 
-        if image_bytes:
-            b64 = prepare_image(image_bytes)
-            messages = [
-                {"role": "system", "content": SYSTEM},
-                {"role": "user", "content": [
-                    {"type": "text", "text": f"{ctx}\nПосмотри на фото. Если скрин пробежки или велопробежки — JSON run_result. Если тренажёр/снаряд на улице — JSON equipment. Если еда — JSON food. Ответь ТОЛЬКО чистым JSON без markdown."},
-                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}}
-                ]}
-            ]
-            resp = client.chat.completions.create(
-                model=VISION_MODEL,
-                messages=messages,
-                max_tokens=800,
-                temperature=0.1,
-                timeout=30
-            )
-        else:
-            history = data.get("chat_history", [])[-30:]
-            messages = (
-                [{"role": "system", "content": SYSTEM}]
-                + history
-                + [{"role": "user", "content": f"{ctx}\n{user_message}"}]
-            )
-            resp = client.chat.completions.create(model=TEXT_MODEL, messages=messages, max_tokens=1000, temperature=0.7)
+# ─── GROQ ─────────────────────────────────────────────────────────────────────
+def ask(d: dict, msg: str, img: bytes = None, audio: bytes = None) -> str:
+    context = ctx(d)
+    try:
+        if audio:
+            t = groq.audio.transcriptions.create(file=("v.ogg",audio,"audio/ogg"), model=AUDIO_MODEL, language="ru")
+            msg = t.text; log.info(f"Voice: {msg}")
 
+        if img:
+            b64 = img_to_b64(img)
+            for attempt in range(3):
+                try:
+                    prompt = (f"{context}\nФото прислал пользователь. Определи что на нём:\n"
+                              "- Скрин из приложения пробежки/велопробежки → JSON run_result\n"
+                              "- Фото тренажёра на улице → JSON equipment\n"
+                              "- Фото еды/блюда → JSON food\n"
+                              "Ответь ТОЛЬКО чистым JSON без markdown.")
+                    resp = groq.chat.completions.create(
+                        model=VISION_MODEL,
+                        messages=[{"role":"system","content":SYSTEM},
+                                  {"role":"user","content":[{"type":"text","text":prompt},
+                                   {"type":"image_url","image_url":{"url":f"data:image/jpeg;base64,{b64}"}}]}],
+                        max_tokens=600, temperature=0.1, timeout=20)
+                    reply = resp.choices[0].message.content.strip()
+                    reply = reply.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+                    if reply and ("{" in reply): return reply
+                except Exception as e:
+                    log.warning(f"Vision attempt {attempt+1}: {e}")
+                    if attempt < 2: import time; time.sleep(2)
+            return ""  # Vision не смог — вернём пустую строку
+
+        hist = d.get("history",[])[-16:]
+        msgs = ([{"role":"system","content":SYSTEM}] + hist +
+                [{"role":"user","content":f"{context}\n{msg}"}])
+        resp = groq.chat.completions.create(model=TEXT_MODEL, messages=msgs, max_tokens=700, temperature=0.7, timeout=30)
         reply = resp.choices[0].message.content.strip()
-        reply = reply.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
-        history = data.get("chat_history", [])
-        history.append({"role": "user", "content": user_message or "📷"})
-        history.append({"role": "assistant", "content": reply})
-        data["chat_history"] = history[-40:]
-        save_data(data)
+        hist.append({"role":"user","content":msg}); hist.append({"role":"assistant","content":reply[:400]})
+        d["history"] = hist[-32:]; save(d)
         return reply
     except Exception as e:
-        log.error(f"Groq error: {e}")
-        return "Что-то пошло не так, попробуй ещё раз."
+        log.error(f"Groq error: {e}"); save(d); return ""
 
-def prepare_image(image_bytes: bytes) -> str:
-    """Конвертирует любое фото (включая HEIC) в base64 JPEG для Groq."""
+def pj(text: str) -> dict | None:
+    if not text: return None
     try:
-        img = Image.open(io.BytesIO(image_bytes))
-        # Конвертируем в RGB если нужно (HEIC может быть RGBA)
-        if img.mode not in ("RGB", "L"):
-            img = img.convert("RGB")
-        # Уменьшаем если слишком большое (Groq лимит)
-        max_size = 1280
-        if max(img.size) > max_size:
-            img.thumbnail((max_size, max_size), Image.LANCZOS)
-        # Сохраняем как JPEG
-        buf = io.BytesIO()
-        img.save(buf, format="JPEG", quality=85)
-        return base64.b64encode(buf.getvalue()).decode("utf-8")
-    except Exception as e:
-        log.error(f"Image conversion error: {e}")
-        return base64.b64encode(image_bytes).decode("utf-8")
-    try:
-        s = text.find("{"); e = text.rfind("}") + 1
-        if s >= 0 and e > s:
-            return json.loads(text[s:e])
-    except:
-        pass
+        s = text.find("{"); e = text.rfind("}")+1
+        if s >= 0 and e > s: return json.loads(text[s:e])
+    except: pass
     return None
 
 # ─── ФОРМАТИРОВАНИЕ ───────────────────────────────────────────────────────────
-def fmt_workout(w: dict) -> str:
+def fmt_wo(w: dict) -> str:
     em = "🚴" if w.get("bike") else "🏃"
     lines = [f"{em} *{w['title']}*", f"⏱ {w.get('estimated_time','?')}"]
-    if w.get("bike"):
-        lines.append("_🚲 Велик до площадки → тренировка → велик домой_\n")
-    else:
-        lines.append("")
-    for i, ex in enumerate(w.get("plan", []), 1):
-        s, r = ex.get("sets", 1), ex.get("reps", "")
-        line = f"{i}. {ex['exercise']} — " + (str(r) if s == 1 else f"{s}×{r}")
-        if ex.get("note"):
-            line += f"\n   _↳ {ex['note']}_"
+    lines.append("_🚲 Велик до площадки → тренировка → велик домой_\n" if w.get("bike") else "")
+    for i,ex in enumerate(w.get("plan",[]),1):
+        s,r = ex.get("sets",1),ex.get("reps","")
+        line = f"{i}. {ex['exercise']} — " + (str(r) if s==1 else f"{s}×{r}")
+        if ex.get("note"): line += f"\n   _↳ {ex['note']}_"
         lines.append(line)
-    if w.get("motivation"):
-        lines.append(f"\n💬 _{w['motivation']}_")
-    if w.get("difficulty_target"):
-        lines.append(f"🎯 _Целевая сложность: {w['difficulty_target']}/5_")
+    if w.get("motivation"): lines.append(f"\n💬 _{w['motivation']}_")
+    if w.get("difficulty_target"): lines.append(f"🎯 _Сложность: {w['difficulty_target']}/5_")
     return "\n".join(lines)
 
 def fmt_run(r: dict) -> str:
-    lines = ["🏃 *Пробежка зафиксирована!*\n"]
-    if r.get("distance_km"): lines.append(f"📏 Дистанция: *{r['distance_km']} км*")
-    if r.get("duration"):    lines.append(f"⏱ Время: *{r['duration']}*")
-    if r.get("pace_avg"):    lines.append(f"⚡ Темп: *{r['pace_avg']}*")
-    if r.get("start_time"):  lines.append(f"🕐 Старт: {r['start_time']}")
-    if r.get("finish_time"): lines.append(f"🏁 Финиш: {r['finish_time']}")
-    if r.get("calories"):    lines.append(f"🔥 ~{r['calories']} ккал")
-    if r.get("app"):         lines.append(f"📱 {r['app']}")
-    if r.get("insight"):     lines.append(f"\n💡 _{r['insight']}_")
-    return "\n".join(lines)
+    L = ["🏃 *Зафиксировано!*\n"]
+    if r.get("distance_km"): L.append(f"📏 *{r['distance_km']} км*")
+    if r.get("duration"):    L.append(f"⏱ {r['duration']}")
+    if r.get("pace_avg"):    L.append(f"⚡ Темп: {r['pace_avg']}")
+    if r.get("start_time"):  L.append(f"🕐 Старт: {r['start_time']}")
+    if r.get("finish_time"): L.append(f"🏁 Финиш: {r['finish_time']}")
+    if r.get("calories"):    L.append(f"🔥 ~{r['calories']} ккал")
+    if r.get("app"):         L.append(f"📱 {r['app']}")
+    if r.get("insight"):     L.append(f"\n💡 _{r['insight']}_")
+    return "\n".join(L)
 
-def fmt_food(f: dict) -> str:
-    ass_emoji = {"хорошо": "✅", "норм": "👍", "плохо": "⚠️"}.get(f.get("assessment","норм"), "👍")
-    lines = [f"{ass_emoji} *{f.get('name','Приём пищи')}*\n"]
-    if f.get("calories"): lines.append(f"🔥 Калории: {f['calories']} ккал")
-    if f.get("protein"):  lines.append(f"💪 Белок: {f['protein']} г")
-    if f.get("carbs"):    lines.append(f"⚡ Углеводы: {f['carbs']} г")
-    if f.get("fat"):      lines.append(f"🥑 Жиры: {f['fat']} г")
-    if f.get("comment"):  lines.append(f"\n💬 _{f['comment']}_")
-    return "\n".join(lines)
+def accept_kb(): return InlineKeyboardMarkup([[
+    InlineKeyboardButton("✅ Принимаю!", callback_data="accept"),
+    InlineKeyboardButton("💬 Изменить", callback_data="suggest"),
+    InlineKeyboardButton("😴 Пропустить", callback_data="skip"),
+]])
+def rating_kb(): return InlineKeyboardMarkup([[
+    InlineKeyboardButton("1",callback_data="r1"),InlineKeyboardButton("2",callback_data="r2"),
+    InlineKeyboardButton("3",callback_data="r3"),InlineKeyboardButton("4",callback_data="r4"),
+    InlineKeyboardButton("5",callback_data="r5"),
+]])
 
-def accept_kb():
-    return InlineKeyboardMarkup([[
-        InlineKeyboardButton("✅ Принимаю!", callback_data="accept"),
-        InlineKeyboardButton("💬 Изменить",  callback_data="suggest"),
-        InlineKeyboardButton("😴 Пропустить", callback_data="skip_today"),
-    ]])
+def do_streak(d: dict):
+    td = today_str()
+    yd = (datetime.now(TIMEZONE)-timedelta(days=1)).strftime("%Y-%m-%d")
+    last = d.get("last_date")
+    s = (d.get("streak",0)+1) if last in (yd,td) else 1
+    d["streak"] = s; d["last_date"] = td
+    if s > d.get("records",{}).get("streak",0): d.setdefault("records",{})["streak"] = s
 
-def rating_kb():
-    return InlineKeyboardMarkup([[
-        InlineKeyboardButton("1 — вышел",  callback_data="rate_1"),
-        InlineKeyboardButton("2 — легко",  callback_data="rate_2"),
-        InlineKeyboardButton("3 — норм",   callback_data="rate_3"),
-        InlineKeyboardButton("4 — огонь",  callback_data="rate_4"),
-        InlineKeyboardButton("5 — убит",   callback_data="rate_5"),
-    ]])
+def add_km(d: dict, km: float) -> bool:
+    wk,mk = week_key(), month_key()
+    d.setdefault("weekly",{}).setdefault(wk,{"done":0,"skipped":0,"km":0})
+    d["weekly"][wk]["km"] += km
+    d.setdefault("monthly_km",{})[mk] = d["monthly_km"].get(mk,0)+km
+    d["last_run_km"] = km
+    rec = km > d.get("records",{}).get("run",0)
+    if rec: d.setdefault("records",{})["run"] = km
+    return rec
 
-def update_streak(data: dict):
-    today = datetime.now(TIMEZONE).strftime("%Y-%m-%d")
-    yesterday = (datetime.now(TIMEZONE) - timedelta(days=1)).strftime("%Y-%m-%d")
-    last = data.get("last_workout_date")
-    data["streak"] = (data.get("streak", 0) + 1) if last in (yesterday, today) else 1
-    data["last_workout_date"] = today
-
-def add_km(data: dict, km: float):
-    week, month = get_week_key(), get_month_key()
-    data.setdefault("weekly_stats", {}).setdefault(week, {"done":0,"skipped":0,"total_km":0})
-    data["weekly_stats"][week]["total_km"] += km
-    data.setdefault("monthly_km", {})[month] = data["monthly_km"].get(month, 0) + km
-    data["last_run_km"] = km
-    # Обновляем рекорд
-    if km > data.get("records", {}).get("max_run_km", 0):
-        data.setdefault("records", {})["max_run_km"] = km
-        return True  # новый рекорд!
-    return False
-
-def update_preferred_time(data: dict, start_time: str):
-    if not start_time:
-        return
-    try:
-        h = int(start_time.split(":")[0])
-        label = ("раннее утро" if h < 9 else "утро (9–12)" if h < 12
-                 else "день" if h < 17 else "вечер")
-        times = data.setdefault("psychology", {}).setdefault("all_start_times", [])
-        times.append(label)
-        data["psychology"]["preferred_time"] = max(set(times), key=times.count)
-    except:
-        pass
-
-def check_achievements(data: dict) -> list[str]:
-    """Проверяет новые достижения и возвращает список новых."""
-    new = []
-    achievements = data.setdefault("achievements", [])
-    runs = data.get("runs", [])
-    records = data.get("records", {})
-    streak = data.get("streak", 0)
-    total_runs = len(runs)
-
-    checks = [
-        ("first_run",    "🏅 Первая пробежка зафиксирована!",        total_runs >= 1),
-        ("run_5km",      "🏅 Первые 5 км без остановки!",             records.get("max_run_km", 0) >= 5),
-        ("run_7km",      "🏅 7 км — ты уже серьёзный бегун!",         records.get("max_run_km", 0) >= 7),
-        ("run_10km",     "🏅 10 КМ! ЦЕЛЬ ДОСТИГНУТА! 🎉",             records.get("max_run_km", 0) >= 10),
-        ("streak_7",     "🔥 7 дней подряд без пропусков!",           streak >= 7),
-        ("streak_30",    "🔥 30 дней подряд — железная воля!",        streak >= 30),
-        ("runs_10",      "📋 10 пробежек зафиксировано!",             total_runs >= 10),
-        ("runs_50",      "📋 50 пробежек — ты машина!",               total_runs >= 50),
-        ("weight_90",    "⚖️ Вес ниже 90 кг — первый рубеж!",         data.get("weight_log", [{}])[-1].get("weight", 94) < 90),
-        ("weight_85",    "⚖️ 85 кг — уже заметно!",                   data.get("weight_log", [{}])[-1].get("weight", 94) < 85),
-        ("weight_80",    "⚖️ 80 КГ! ЦЕЛЬ ПО ВЕСУ ДОСТИГНУТА! 🎉",     data.get("weight_log", [{}])[-1].get("weight", 94) <= 80),
+def check_ach(d: dict) -> list:
+    new=[]; done=d.setdefault("achievements",[])
+    r=d.get("records",{}); wl=d.get("weight_log",[{}]); w=wl[-1].get("weight",94)
+    checks=[
+        ("r1","🏅 Первая тренировка!", len(d.get("runs",[]))>=1),
+        ("r5","🏅 Первые 5 км!", r.get("run",0)>=5),
+        ("r7","🏅 7 км — уже серьёзно!", r.get("run",0)>=7),
+        ("r10","🎉 10 КМ! ЦЕЛЬ ДОСТИГНУТА!",r.get("run",0)>=10),
+        ("s7","🔥 7 дней подряд!",d.get("streak",0)>=7),
+        ("s30","🔥 30 дней — железная воля!",d.get("streak",0)>=30),
+        ("w90","⚖️ Меньше 90 кг!",w<90),("w85","⚖️ 85 кг!",w<85),("w80","🎉 80 КГ! ЦЕЛЬ!",w<=80),
     ]
-    for key, msg, condition in checks:
-        if condition and key not in achievements:
-            achievements.append(key)
-            new.append(msg)
+    for k,msg,c in checks:
+        if c and k not in done: done.append(k); new.append(msg)
     return new
 
-def check_plateau(data: dict) -> bool:
-    """Проверяет стагнацию веса (2+ недели без изменений)."""
-    weight_log = data.get("weight_log", [])
-    if len(weight_log) < 4:
-        return False
-    recent = [w["weight"] for w in weight_log[-4:]]
-    return max(recent) - min(recent) < 0.5
-
-def check_challenge_progress(data: dict) -> str | None:
-    """Проверяет активные челленджи."""
-    challenges = data.get("challenges", [])
-    for ch in challenges:
-        if ch.get("done"):
-            continue
-        if ch["type"] == "no_skip" and data.get("streak", 0) >= ch["target"]:
-            ch["done"] = True
-            return f"🏆 Челлендж выполнен: {ch['name']}!"
-        elif ch["type"] == "run_km":
-            total = data.get("monthly_km", {}).get(get_month_key(), 0)
-            if total >= ch["target"]:
-                ch["done"] = True
-                return f"🏆 Челлендж выполнен: {ch['name']}!"
-    return None
-
-# ─── ЭКСПОРТ ──────────────────────────────────────────────────────────────────
-def export_csv(data: dict) -> bytes:
-    output = io.StringIO()
-    writer = csv.writer(output)
-    writer.writerow(["Дата", "Тип", "Км", "Темп", "Время", "Вес", "Оценка"])
-    runs = data.get("runs", [])
-    weight_log = {w["date"]: w["weight"] for w in data.get("weight_log", [])}
-    ratings = data.get("psychology", {}).get("avg_rating", [])
-    for i, r in enumerate(runs):
-        date = r.get("timestamp", "")[:10]
-        writer.writerow([
-            date, "Бег",
-            r.get("distance_km", ""),
-            r.get("pace_avg", ""),
-            r.get("duration", ""),
-            weight_log.get(date, ""),
-            ratings[i] if i < len(ratings) else ""
-        ])
-    return output.getvalue().encode("utf-8-sig")
-
 # ─── КОМАНДЫ ──────────────────────────────────────────────────────────────────
-async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "💪 *Привет! Я Макс — твой личный тренер.*\n\n"
-        "📷 Скинь скрин пробежки — всё зафиксирую\n"
-        "🍽 Скинь фото еды — оценю калории и белки\n"
-        "🎤 Говори голосом — понимаю русский\n"
-        "🌙 *20:00* — план на завтра\n"
-        "⏰ *6:30* — подъём с кнопками принятия\n"
-        "📊 *Воскресенье* — итоги и сравнение недель\n"
-        "⚖️ *Понедельник* — спрошу вес\n\n"
-        "/workout — тренировка сейчас\n"
-        "/done — выполнил\n"
-        "/skip причина — пропустить\n"
-        "/weight 93 — записать вес\n"
-        "/stats — статистика\n"
-        "/records — личные рекорды\n"
-        "/challenge — активный челлендж\n"
-        "/feeling — как себя чувствую\n"
-        "/export — скачать все данные\n"
-        "/profile — мой психопрофиль",
-        parse_mode="Markdown"
-    )
+async def cmd_start(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    await u.message.reply_text(
+        "💪 *Тренер Макс — твой личный тренер*\n\n"
+        "📷 Скрин пробежки → зафиксирую\n🍽 Фото еды → калории\n🎤 Голос → понимаю\n"
+        "🌙 20:00 — план на завтра\n⏰ 6:30 — подъём!\n\n"
+        "/workout — тренировка\n/done — выполнил\n/skip — пропустить\n"
+        "/weight 93 — записать вес\n/stats — статистика\n"
+        "/records — рекорды\n/challenge — челленджи\n/export — данные CSV",
+        parse_mode="Markdown")
 
-async def cmd_workout(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    data = load_data()
-    weekday = datetime.now(TIMEZONE).strftime("%A")
-    weather_arg = " ".join(ctx.args) if ctx.args else ""
-    weather = get_weather(target_hour=datetime.now(TIMEZONE).hour + 1) if not weather_arg else {}
-    bike_ok = weather.get("bike_ok", True)
-    weather_context = weather_arg or weather.get("summary", "ясно")
-
-    # Учитываем самочувствие
-    feeling_log = data.get("feeling_log", [])
-    feeling_ctx = ""
-    if feeling_log:
-        lf = feeling_log[-1]
-        if lf.get("pain") and lf["pain"] != "нет":
-            feeling_ctx = f"Пользователь сообщал о боли: {lf['pain']}. Избегай нагрузку на эту зону. "
-
-    msg = await update.message.reply_text("⏳ Составляю тренировку...")
-    reply = ask_groq(data,
-        f"Составь тренировку на сегодня ({weekday}). Погода: {weather_context}. "
-        f"{'Велик можно.' if bike_ok else 'Велик НЕ берём.'} {feeling_ctx}"
-        "Ответь ТОЛЬКО чистым JSON workout."
-    )
-    w = parse_json(reply)
-    if w and w.get("type") == "workout":
-        if not bike_ok:
-            w["bike"] = False
-        data["pending_workout"] = w
-        data["workout_accepted"] = False
-        save_data(data)
-        weather_str = fmt_weather(weather, "сейчас") if weather else ""
-        text = (weather_str + "\n\n" + fmt_workout(w)) if weather_str else fmt_workout(w)
-        await msg.edit_text(text, parse_mode="Markdown", reply_markup=accept_kb())
+async def cmd_workout(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    d = load()
+    wday = datetime.now(TIMEZONE).strftime("%A")
+    warg = " ".join(c.args) if c.args else ""
+    wth = weather(datetime.now(TIMEZONE).hour+1) if not warg else {}
+    bike = wth.get("bike",True)
+    wctx = warg or wth.get("summary","ясно")
+    fl = d.get("feeling_log",[])
+    pain = f"Боль: {fl[-1]['pain']} — исключи. " if fl and fl[-1].get("pain") and "нет" not in str(fl[-1].get("pain","")) else ""
+    msg = await u.message.reply_text("⏳ Составляю...")
+    reply = ask(d, f"Тренировка на сегодня ({wday}). Погода: {wctx}. {'Велик можно.' if bike else 'Велик НЕ берём.'} {pain}ТОЛЬКО JSON workout.")
+    w = pj(reply)
+    if w and w.get("type")=="workout":
+        if not bike: w["bike"]=False
+        d["pending"]=w; d["accepted"]=False; save(d)
+        wstr = fmt_w(wth,"сейчас") if wth else ""
+        await msg.edit_text((wstr+"\n\n"+fmt_wo(w)) if wstr else fmt_wo(w), parse_mode="Markdown", reply_markup=accept_kb())
     else:
-        await msg.edit_text(reply)
+        await msg.edit_text("Попробуй ещё раз /workout")
 
-async def cmd_done(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    data = load_data()
-    week = get_week_key()
-    data.setdefault("weekly_stats", {}).setdefault(week, {"done":0,"skipped":0,"total_km":0})
-    data["weekly_stats"][week]["done"] += 1
-    update_streak(data)
-    comment = " ".join(ctx.args) if ctx.args else ""
+async def cmd_done(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    d = load()
+    wk = week_key()
+    d.setdefault("weekly",{}).setdefault(wk,{"done":0,"skipped":0,"km":0})["done"] += 1
+    do_streak(d); ach = check_ach(d)
+    cmt = " ".join(c.args) if c.args else ""
+    reply = ask(d, f"Тренировка выполнена! {cmt} Похвали (1-2 предл.) и попроси оценку 1-5.")
+    save(d)
+    txt = f"🎉 *Засчитано! Серия: {d['streak']} дней* 🔥\n\n{reply or 'Отлично! Оцени сложность:'}"
+    if ach: txt += "\n\n" + "\n".join(ach)
+    await u.message.reply_text(txt, parse_mode="Markdown", reply_markup=rating_kb())
 
-    # Проверяем достижения
-    new_achievements = check_achievements(data)
-    challenge_done = check_challenge_progress(data)
-    save_data(data)
+async def cmd_skip(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    d = load()
+    wk = week_key()
+    d.setdefault("weekly",{}).setdefault(wk,{"done":0,"skipped":0,"km":0})["skipped"] += 1
+    d["streak"] = 0
+    reason = " ".join(c.args) if c.args else "без причины"
+    d.setdefault("psych",{}).setdefault("skips",[]).append({"date":today_str(),"reason":reason})
+    reply = ask(d, f"Пропустил. Причина: {reason}. 1-2 предл. — пойми и мотивируй на завтра.")
+    save(d)
+    await u.message.reply_text(reply or "Окей, завтра выходим! 💪")
 
-    reply = ask_groq(data, f"Тренировка выполнена! {comment} Похвали коротко (1-2 предл.) и попроси оценку 1-5.")
-    text = f"🎉 *Засчитано! Серия: {data['streak']} дней* 🔥\n\n{reply}"
-    if new_achievements:
-        text += "\n\n" + "\n".join(new_achievements)
-    if challenge_done:
-        text += f"\n\n{challenge_done}"
-    await update.message.reply_text(text, parse_mode="Markdown", reply_markup=rating_kb())
-
-async def cmd_skip(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    data = load_data()
-    week = get_week_key()
-    data.setdefault("weekly_stats", {}).setdefault(week, {"done":0,"skipped":0,"total_km":0})
-    data["weekly_stats"][week]["skipped"] += 1
-    data["streak"] = 0
-    reason = " ".join(ctx.args) if ctx.args else "без причины"
-    data.setdefault("psychology", {}).setdefault("skip_patterns", []).append(
-        {"date": datetime.now(TIMEZONE).strftime("%Y-%m-%d"), "reason": reason}
-    )
-    reply = ask_groq(data, f"Пропустил. Причина: {reason}. Пойми, не ругай, 1-2 предл. Без JSON.")
-    save_data(data)
-    await update.message.reply_text(reply)
-
-async def cmd_weight(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    data = load_data()
-    if not ctx.args:
-        await update.message.reply_text("Напиши так: /weight 93")
-        return
+async def cmd_weight(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    d = load()
+    if not c.args: await u.message.reply_text("Пример: /weight 93"); return
     try:
-        weight = float(ctx.args[0].replace(",", "."))
-        data.setdefault("weight_log", []).append({
-            "date": datetime.now(TIMEZONE).strftime("%Y-%m-%d"),
-            "weight": weight
-        })
-        lost = 94 - weight
-        left = weight - 80
-        new_ach = check_achievements(data)
-        is_plateau = check_plateau(data)
-        save_data(data)
+        wt = float(c.args[0].replace(",","."))
+        d.setdefault("weight_log",[]).append({"date":today_str(),"weight":wt})
+        lost = 94-wt; left = wt-80
+        wl = d["weight_log"]
+        plateau = len(wl)>=4 and max(x["weight"] for x in wl[-4:])-min(x["weight"] for x in wl[-4:])<0.5
+        pctx = "Вес стоит уже 2+ недели — посоветуй что изменить. " if plateau else ""
+        ach = check_ach(d)
+        reply = ask(d, f"Вес: {wt} кг. Сброшено {lost:.1f} кг, до цели {left:.1f} кг. {pctx}Прокомментируй.")
+        save(d)
+        txt = f"⚖️ *{wt} кг*\n📉 Сброшено: {lost:.1f} кг | До цели: {left:.1f} кг\n\n{reply or ''}"
+        if ach: txt += "\n\n"+"\n".join(ach)
+        await u.message.reply_text(txt, parse_mode="Markdown")
+    except: await u.message.reply_text("Пример: /weight 93")
 
-        plateau_ctx = "Вес стоит уже 2+ недели — предложи что изменить (питание/интенсивность). " if is_plateau else ""
-        reply = ask_groq(data,
-            f"Вес: {weight} кг. Сброшено {lost:.1f} кг, осталось {left:.1f} кг. {plateau_ctx}"
-            "Прокомментируй коротко. Без JSON."
-        )
-        text = (
-            f"⚖️ *{weight} кг*\n"
-            f"📉 Сброшено: *{lost:.1f} кг*\n"
-            f"🎯 До цели: *{left:.1f} кг*\n\n{reply}"
-        )
-        if new_ach:
-            text += "\n\n" + "\n".join(new_ach)
-        await update.message.reply_text(text, parse_mode="Markdown")
-    except:
-        await update.message.reply_text("Не понял. Напиши так: /weight 93")
+async def cmd_stats(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    d = load()
+    w = d.get("weekly",{}).get(week_key(),{"done":0,"skipped":0,"km":0})
+    wl = d.get("weight_log",[{}]); r = d.get("records",{})
+    await u.message.reply_text(
+        f"📊 *Статистика*\n\n"
+        f"*Неделя:* ✅{w['done']} тр. ❌{w['skipped']} пр. 🏃{w['km']:.1f} км\n"
+        f"*Месяц:* {d.get('monthly_km',{}).get(month_key(),0):.1f} км\n\n"
+        f"🔥 Серия: {d.get('streak',0)} дней\n"
+        f"📏 Бег: {d['last_run_km']} км | Рекорд: {r.get('run',0)} км\n"
+        f"⚖️ Вес: {wl[-1].get('weight','?')} кг\n"
+        f"📋 Пробежек: {len(d.get('runs',[]))}\n"
+        f"🏅 Достижений: {len(d.get('achievements',[]))}",
+        parse_mode="Markdown")
 
-async def cmd_feeling(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    data = load_data()
-    reply = ask_groq(data,
-        "Спроси как пользователь себя чувствует — энергия, болят ли мышцы, есть ли боли. "
-        "Коротко, 1-2 вопроса. Без JSON."
-    )
-    await update.message.reply_text(reply)
+async def cmd_records(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    d = load(); r = d.get("records",{})
+    runs = d.get("runs",[])
+    paces = [x.get("pace_avg","") for x in runs if x.get("pace_avg")]
+    await u.message.reply_text(
+        f"🏆 *Рекорды*\n\n"
+        f"🏃 Макс дистанция: *{r.get('run',0)} км*\n"
+        f"⚡ Лучший темп: *{min(paces) if paces else 'нет данных'}*\n"
+        f"🔥 Макс серия: *{r.get('streak',0)} дней*",
+        parse_mode="Markdown")
 
-async def cmd_records(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    data = load_data()
-    r = data.get("records", {})
-    runs = data.get("runs", [])
-    best_pace = ""
-    if runs:
-        paces = [(r.get("pace_avg",""), r.get("distance_km",0)) for r in runs if r.get("pace_avg")]
-        if paces:
-            best_pace = min(paces, key=lambda x: x[0])[0]
-    await update.message.reply_text(
-        f"🏆 *Личные рекорды*\n\n"
-        f"🏃 Макс дистанция: *{r.get('max_run_km', 0)} км*\n"
-        f"⚡ Лучший темп: *{best_pace or 'нет данных'}*\n"
-        f"💪 Подтягивания: *{r.get('max_pullups', 0)} повт.*\n"
-        f"📋 Всего пробежек: *{len(runs)}*\n"
-        f"🔥 Макс серия: *{r.get('max_streak', data.get('streak',0))} дней*",
-        parse_mode="Markdown"
-    )
-
-async def cmd_challenge(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    data = load_data()
-    challenges = data.get("challenges", [])
-    active = [c for c in challenges if not c.get("done")]
+async def cmd_challenge(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    d = load()
+    active = [x for x in d.get("challenges",[]) if not x.get("done")]
     if active:
         ch = active[0]
-        if ch["type"] == "no_skip":
-            current = data.get("streak", 0)
-            text = (
-                f"🎯 *Активный челлендж:* {ch['name']}\n\n"
-                f"Прогресс: {current}/{ch['target']} дней\n"
-                f"{'▓' * current}{'░' * (ch['target']-current)}"
-            )
-        else:
-            current = data.get("monthly_km", {}).get(get_month_key(), 0)
-            text = (
-                f"🎯 *Активный челлендж:* {ch['name']}\n\n"
-                f"Прогресс: {current:.1f}/{ch['target']} км"
-            )
-        await update.message.reply_text(text, parse_mode="Markdown")
+        cur = d.get("streak",0) if ch["type"]=="no_skip" else d.get("monthly_km",{}).get(month_key(),0)
+        bar = "▓"*min(int(cur),ch["target"])+"░"*max(0,ch["target"]-int(cur))
+        await u.message.reply_text(f"🎯 *{ch['name']}*\n\n{bar}\n{cur:.0f}/{ch['target']}", parse_mode="Markdown")
     else:
-        # Предлагаем челлендж
-        streak = data.get("streak", 0)
-        if streak >= 3:
-            keyboard = InlineKeyboardMarkup([[
-                InlineKeyboardButton("7 дней подряд", callback_data="ch_7days"),
-                InlineKeyboardButton("30 дней подряд", callback_data="ch_30days"),
-            ],[
-                InlineKeyboardButton("50 км за месяц", callback_data="ch_50km"),
-                InlineKeyboardButton("100 км за месяц", callback_data="ch_100km"),
-            ]])
-            await update.message.reply_text(
-                "🎯 *Выбери челлендж:*",
-                parse_mode="Markdown",
-                reply_markup=keyboard
-            )
-        else:
-            await update.message.reply_text(
-                "Потренируйся ещё немного — и предложу тебе первый челлендж! 💪"
-            )
+        kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton("7 дней",callback_data="ch7"),
+            InlineKeyboardButton("30 дней",callback_data="ch30"),
+        ],[
+            InlineKeyboardButton("50 км/мес",callback_data="ch50"),
+            InlineKeyboardButton("100 км/мес",callback_data="ch100"),
+        ]])
+        await u.message.reply_text("🎯 *Выбери челлендж:*", parse_mode="Markdown", reply_markup=kb)
 
-async def cmd_export(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    data = load_data()
-    csv_bytes = export_csv(data)
-    month = datetime.now(TIMEZONE).strftime("%Y-%m")
-    await update.message.reply_document(
-        document=io.BytesIO(csv_bytes),
-        filename=f"тренировки_{month}.csv",
-        caption=f"📊 Все твои данные за {month}"
-    )
-
-async def cmd_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    data = load_data()
-    w = data.get("weekly_stats", {}).get(get_week_key(), {"done":0,"skipped":0,"total_km":0})
-    runs = data.get("runs", [])
-    best = max((r.get("distance_km", 0) for r in runs), default=0)
-    month_km = data.get("monthly_km", {}).get(get_month_key(), 0)
-    weight_log = data.get("weight_log", [])
-    weight_str = f"{weight_log[-1]['weight']} кг" if weight_log else "не записан"
-    challenges = [c for c in data.get("challenges", []) if not c.get("done")]
-    await update.message.reply_text(
-        f"📊 *Статистика*\n\n"
-        f"*Эта неделя:*\n"
-        f"✅ Тренировок: {w['done']}  ❌ Пропусков: {w['skipped']}\n"
-        f"🏃 Набегано: {w['total_km']:.1f} км\n\n"
-        f"*Этот месяц:* {month_km:.1f} км\n\n"
-        f"*Всего:*\n"
-        f"🔥 Серия: {data.get('streak',0)} дней\n"
-        f"📏 Текущий бег: {data['last_run_km']} км\n"
-        f"🏆 Рекорд: {best} км\n"
-        f"📋 Пробежек: {len(runs)}\n"
-        f"⚖️ Вес: {weight_str}\n"
-        + (f"🎯 Челленджей: {len(challenges)} активных" if challenges else ""),
-        parse_mode="Markdown"
-    )
-
-async def cmd_profile(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    data = load_data()
-    psych = data.get("psychology", {})
-    ratings = psych.get("avg_rating", [])
-    skips = psych.get("skip_patterns", [])
-    lines = ["🧠 *Психопрофиль*\n"]
-    lines.append(f"⏰ Выходишь: {psych.get('preferred_time') or 'мало данных'}")
-    if ratings:
-        avg = sum(ratings[-10:]) / len(ratings[-10:])
-        label = ("можно добавлять" if avg < 2.5 else "на пределе" if avg > 4 else "рабочая зона ✅")
-        lines.append(f"💪 Нагрузка: {avg:.1f}/5 — {label}")
-    lines.append(f"📉 Пропусков: {len(skips)}")
-    lines.append(f"🏅 Достижений: {len(data.get('achievements', []))}")
-    analysis = ask_groq(data, "Психологический анализ: когда выходит, что мотивирует, риски. 3 предл. Без JSON.")
-    lines.append(f"\n💬 *Анализ:*\n{analysis}")
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+async def cmd_export(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    d = load(); out = io.StringIO()
+    w = csv.writer(out); w.writerow(["Дата","Км","Темп","Время"])
+    for r in d.get("runs",[]): w.writerow([r.get("timestamp","")[:10],r.get("distance_km",""),r.get("pace_avg",""),r.get("duration","")])
+    await u.message.reply_document(document=io.BytesIO(out.getvalue().encode("utf-8-sig")),
+        filename=f"тренировки_{month_key()}.csv", caption="📊 Твои данные")
 
 # ─── ФОТО ─────────────────────────────────────────────────────────────────────
-async def on_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat.id != YOUR_CHAT_ID:
-        return
-    msg = await update.message.reply_text("📷 Смотрю...")
+async def on_photo(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    if u.effective_chat.id != YOUR_CHAT_ID: return
+    msg = await u.message.reply_text("📷 Смотрю...")
     try:
-        photo = update.message.photo[-1]
-        file = await ctx.bot.get_file(photo.file_id)
-        img_bytes = bytes(await file.download_as_bytearray())
-        data = load_data()
-        reply = ask_groq(data, "фото", img_bytes)
-        result = parse_json(reply)
+        photo = u.message.photo[-1]
+        f = await c.bot.get_file(photo.file_id)
+        img_bytes = bytes(await f.download_as_bytearray())
+        d = load()
+        reply = ask(d, "", img_bytes)
+        result = pj(reply)
     except Exception as e:
-        log.error(f"Photo error: {e}")
-        await msg.edit_text("⚠️ Не смог обработать фото. Попробуй ещё раз или скинь другое фото.")
+        log.error(f"Photo: {e}")
+        await msg.edit_text("⚠️ Ошибка. Попробуй ещё раз или напиши данные текстом.")
         return
 
-    if result and result.get("type") == "run_result":
-        record = {"timestamp": datetime.now(TIMEZONE).isoformat(),
-                  **{k:v for k,v in result.items() if k != "type"}}
-        data.setdefault("runs", []).append(record)
-        km = result.get("distance_km", 0)
-        is_record = False
+    if result and result.get("type")=="run_result":
+        rec = {"ts":datetime.now(TIMEZONE).isoformat(), **{k:v for k,v in result.items() if k!="type"}}
+        d.setdefault("runs",[]).append(rec)
+        km = result.get("distance_km",0)
+        is_rec = False
         if km:
-            is_record = add_km(data, km)
-            data.setdefault("weekly_stats", {}).setdefault(get_week_key(), {"done":0,"skipped":0,"total_km":0})["done"] += 1
-        update_streak(data)
-        update_preferred_time(data, result.get("start_time", ""))
-        new_ach = check_achievements(data)
-        save_data(data)
-        text = fmt_run(record)
-        if is_record:
-            text += f"\n\n🏆 *Новый рекорд — {km} км!*"
-        if new_ach:
-            text += "\n\n" + "\n".join(new_ach)
-        text += "\n\n*Как оцениваешь сложность?*"
-        await msg.edit_text(text, parse_mode="Markdown", reply_markup=rating_kb())
+            is_rec = add_km(d,km)
+            d.setdefault("weekly",{}).setdefault(week_key(),{"done":0,"skipped":0,"km":0})["done"] += 1
+        do_streak(d)
+        if result.get("start_time"):
+            h = int(str(result["start_time"]).split(":")[0]) if ":" in str(result.get("start_time","")) else 0
+            label = "раннее утро" if h<9 else "утро" if h<12 else "день" if h<17 else "вечер"
+            times = d.setdefault("psych",{}).setdefault("times",[])
+            times.append(label)
+            d["psych"]["preferred"] = max(set(times),key=times.count)
+        ach = check_ach(d); save(d)
+        txt = fmt_run(rec)
+        if is_rec: txt += f"\n\n🏆 *Новый рекорд — {km} км!*"
+        if ach: txt += "\n\n"+"\n".join(ach)
+        txt += "\n\n*Оцени сложность (1-5):*"
+        await msg.edit_text(txt, parse_mode="Markdown", reply_markup=rating_kb())
 
-    elif result and result.get("type") == "equipment":
-        eq = result
-        name = eq.get("name", "Тренажёр")
-        equipment_list = data.setdefault("equipment", [])
-        is_new = name not in [e.get("name") for e in equipment_list]
-        if is_new:
-            equipment_list.append({"name": name, "muscle_group": eq.get("muscle_group",""),
-                                   "sets_reps": eq.get("sets_reps","4×12"), "note": eq.get("note","")})
-            save_data(data)
-        text = (
-            f"💪 *{name}*\n\n"
-            f"🎯 {eq.get('muscle_group','')}\n"
-            f"📋 {eq.get('how_to_use','')}\n"
-            f"🔢 {eq.get('sets_reps','')}\n"
-        )
-        if eq.get("note"):
-            text += f"💡 _{eq['note']}_\n"
-        text += f"\n{'✅ Добавил в арсенал!' if is_new else '_Уже в программе_'}"
-        keyboard = InlineKeyboardMarkup([[
-            InlineKeyboardButton("📋 Перестроить тренировку", callback_data="rebuild_workout"),
-            InlineKeyboardButton("➕ Ещё тренажёр", callback_data="more_equipment"),
+    elif result and result.get("type")=="equipment":
+        name = result.get("name","Тренажёр")
+        eq = d.setdefault("equipment",[])
+        new = name not in [e.get("name") for e in eq]
+        if new: eq.append({"name":name,"muscle_group":result.get("muscle_group",""),"sets_reps":result.get("sets_reps","4×12")}); save(d)
+        txt = (f"💪 *{name}*\n🎯 {result.get('muscle_group','')}\n"
+               f"📋 {result.get('how_to_use','')}\n🔢 {result.get('sets_reps','')}\n"
+               f"\n{'✅ Добавил!' if new else '_Уже есть_'}")
+        kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton("📋 Перестроить тренировку",callback_data="rebuild"),
+            InlineKeyboardButton("➕ Ещё",callback_data="more_eq"),
         ]])
-        await msg.edit_text(text, parse_mode="Markdown", reply_markup=keyboard)
+        await msg.edit_text(txt, parse_mode="Markdown", reply_markup=kb)
 
-    elif result and result.get("type") == "food":
-        record = {"timestamp": datetime.now(TIMEZONE).isoformat(),
-                  **{k:v for k,v in result.items() if k != "type"}}
-        data.setdefault("food_log", []).append(record)
-        today = datetime.now(TIMEZONE).strftime("%Y-%m-%d")
-        today_cal = sum(
-            f.get("calories", 0) for f in data["food_log"]
-            if f.get("timestamp", "")[:10] == today
-        )
-        save_data(data)
-        text = fmt_food(result) + f"\n\n📊 _Калорий сегодня: ~{today_cal} ккал_"
-        await msg.edit_text(text, parse_mode="Markdown")
-
+    elif result and result.get("type")=="food":
+        d.setdefault("food_log",[]).append({"ts":datetime.now(TIMEZONE).isoformat(),**result})
+        td = today_str()
+        total_cal = sum(f.get("calories",0) for f in d["food_log"] if f.get("ts","")[:10]==td)
+        save(d)
+        ass = {"хорошо":"✅","норм":"👍","плохо":"⚠️"}.get(result.get("assessment","норм"),"👍")
+        await msg.edit_text(
+            f"{ass} *{result.get('name','Еда')}*\n"
+            f"🔥 {result.get('calories',0)} ккал | 💪 {result.get('protein',0)}г белка\n"
+            f"_{result.get('comment','')}_\n\n📊 Сегодня: ~{total_cal} ккал",
+            parse_mode="Markdown")
     else:
-        # Groq не вернул JSON — спрашиваем уточнение
-        keyboard = InlineKeyboardMarkup([[
-            InlineKeyboardButton("🏃 Пробежка/велик", callback_data="photo_run"),
-            InlineKeyboardButton("💪 Тренажёр", callback_data="photo_equipment"),
-            InlineKeyboardButton("🍽 Еда", callback_data="photo_food"),
+        # Vision не сработал — умный fallback
+        kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton("🏃 Пробежка/велик", callback_data="ph_run"),
+            InlineKeyboardButton("💪 Тренажёр", callback_data="ph_eq"),
+            InlineKeyboardButton("🍽 Еда", callback_data="ph_food"),
         ]])
         await msg.edit_text(
-            "Не смог распознать автоматически. Что на фото?",
-            reply_markup=keyboard
-        )
-
-    if result and result.get("type") == "run_result":
-        record = {"timestamp": datetime.now(TIMEZONE).isoformat(),
-                  **{k:v for k,v in result.items() if k != "type"}}
-        data.setdefault("runs", []).append(record)
-        km = result.get("distance_km", 0)
-        is_record = False
-        if km:
-            is_record = add_km(data, km)
-            data.setdefault("weekly_stats", {}).setdefault(get_week_key(), {"done":0,"skipped":0,"total_km":0})["done"] += 1
-        update_streak(data)
-        update_preferred_time(data, result.get("start_time", ""))
-        new_ach = check_achievements(data)
-        save_data(data)
-        text = fmt_run(record)
-        if is_record:
-            text += f"\n\n🏆 *Новый рекорд дистанции — {km} км!*"
-        if new_ach:
-            text += "\n\n" + "\n".join(new_ach)
-        text += "\n\n*Как оцениваешь сложность?*"
-        await msg.edit_text(text, parse_mode="Markdown", reply_markup=rating_kb())
-
-    elif result and result.get("type") == "equipment":
-        eq = result
-        name = eq.get("name", "Тренажёр")
-        equipment_list = data.setdefault("equipment", [])
-        is_new = name not in [e.get("name") for e in equipment_list]
-        if is_new:
-            equipment_list.append({"name": name, "muscle_group": eq.get("muscle_group",""),
-                                   "sets_reps": eq.get("sets_reps","4×12"), "note": eq.get("note","")})
-            save_data(data)
-        text = (
-            f"💪 *{name}*\n\n"
-            f"🎯 {eq.get('muscle_group','')}\n"
-            f"📋 {eq.get('how_to_use','')}\n"
-            f"🔢 {eq.get('sets_reps','')}\n"
-        )
-        if eq.get("note"):
-            text += f"💡 _{eq['note']}_\n"
-        text += f"\n{'✅ Добавил в арсенал!' if is_new else '_Уже в программе_'}"
-        keyboard = InlineKeyboardMarkup([[
-            InlineKeyboardButton("📋 Перестроить тренировку", callback_data="rebuild_workout"),
-            InlineKeyboardButton("➕ Ещё тренажёр", callback_data="more_equipment"),
-        ]])
-        await msg.edit_text(text, parse_mode="Markdown", reply_markup=keyboard)
-
-    elif result and result.get("type") == "food":
-        record = {"timestamp": datetime.now(TIMEZONE).isoformat(),
-                  **{k:v for k,v in result.items() if k != "type"}}
-        data.setdefault("food_log", []).append(record)
-        # Считаем калории за день
-        today = datetime.now(TIMEZONE).strftime("%Y-%m-%d")
-        today_cal = sum(
-            f.get("calories", 0) for f in data["food_log"]
-            if f.get("timestamp", "")[:10] == today
-        )
-        save_data(data)
-        text = fmt_food(result) + f"\n\n📊 _Калорий сегодня: ~{today_cal} ккал_"
-        await msg.edit_text(text, parse_mode="Markdown")
-    else:
-        await msg.edit_text("Не смог распознать. Это скрин пробежки, фото тренажёра или еды?")
+            "Не смог распознать автоматически.\n\n"
+            "_Или напиши текстом:_\n"
+            "• «пробежал 5 км за 28 минут»\n"
+            "• «добавь тренажёр: жим лёжа»",
+            parse_mode="Markdown", reply_markup=kb)
 
 # ─── ГОЛОС ────────────────────────────────────────────────────────────────────
-async def on_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat.id != YOUR_CHAT_ID:
-        return
-    msg = await update.message.reply_text("🎤 Слушаю...")
-    voice = update.message.voice
-    file = await ctx.bot.get_file(voice.file_id)
-    audio_bytes = bytes(await file.download_as_bytearray())
-    data = load_data()
-    reply = ask_groq(data, "", audio_bytes=audio_bytes)
-    await msg.edit_text(f"🎤 _{reply[:100]}..._\n\n" if len(reply) > 100 else f"🎤 _{reply}_\n\n", parse_mode="Markdown")
-    # Отвечаем как на обычное сообщение
-    response = ask_groq(data, reply)
-    w = parse_json(response)
-    if w and w.get("type") == "workout":
-        data["pending_workout"] = w
-        save_data(data)
-        await update.message.reply_text(fmt_workout(w), parse_mode="Markdown", reply_markup=accept_kb())
-    else:
-        await update.message.reply_text(response)
+async def on_voice(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    if u.effective_chat.id != YOUR_CHAT_ID: return
+    msg = await u.message.reply_text("🎤 Слушаю...")
+    try:
+        f = await c.bot.get_file(u.message.voice.file_id)
+        ab = bytes(await f.download_as_bytearray())
+        d = load()
+        t = groq.audio.transcriptions.create(file=("v.ogg",ab,"audio/ogg"),model=AUDIO_MODEL,language="ru")
+        text = t.text
+        await msg.edit_text(f"🎤 _{text}_", parse_mode="Markdown")
+        reply = ask(d, text); save(d)
+        wo = pj(reply)
+        if wo and wo.get("type")=="workout":
+            d["pending"]=wo; d["accepted"]=False; save(d)
+            await u.message.reply_text(fmt_wo(wo), parse_mode="Markdown", reply_markup=accept_kb())
+        elif reply:
+            await u.message.reply_text(reply)
+    except Exception as e:
+        log.error(f"Voice: {e}"); await msg.edit_text("Не смог распознать голос.")
 
 # ─── КНОПКИ ───────────────────────────────────────────────────────────────────
-RATE_NEXT = {
-    1: "Главное — вышел. Следующая такая же.",
-    2: "Легко прошло — добавим чуть нагрузки.",
-    3: "Рабочий режим! Следующая на 10% тяжелее.",
-    4: "Огонь! Ты в своей зоне.",
-    5: "Мощно! Следующая — лёгкое восстановление."
-}
+RATES = {1:"Вышел — уже победа. Следующая такая же.",2:"Легко — добавим нагрузки.",
+         3:"Рабочий режим! Следующая чуть тяжелее.",4:"Огонь! Держим темп.",5:"Мощно! Следующая — восстановление."}
 
-async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    data = load_data()
+async def on_btn(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    q = u.callback_query; await q.answer()
+    d = load()
 
-    if q.data.startswith("rate_"):
-        n = int(q.data[-1])
-        data.setdefault("psychology", {}).setdefault("avg_rating", []).append(n)
-        # Обновляем рекорд серии
-        streak = data.get("streak", 0)
-        if streak > data.get("records", {}).get("max_streak", 0):
-            data.setdefault("records", {})["max_streak"] = streak
-        save_data(data)
+    if q.data.startswith("r") and q.data[1:].isdigit():
+        n = int(q.data[1:])
+        d.setdefault("psych",{}).setdefault("ratings",[]).append(n); save(d)
         await q.edit_message_reply_markup(None)
-        await q.message.reply_text(f"Оценка {n}/5 ✓\n{RATE_NEXT[n]}")
+        await q.message.reply_text(f"Оценка {n}/5 ✓\n{RATES[n]}")
 
-    elif q.data == "accept":
-        data["workout_accepted"] = True
-        save_data(data)
+    elif q.data=="accept":
+        d["accepted"]=True; save(d)
         await q.edit_message_reply_markup(None)
-        await q.message.reply_text(
-            "🔥 *Принято! Вперёд!*\n\n"
-            "Когда закончишь — /done и скрин тренировки 📷",
-            parse_mode="Markdown"
-        )
+        await q.message.reply_text("🔥 *Принято! Вперёд!*\n\nКогда закончишь — /done и скрин 📷", parse_mode="Markdown")
 
-    elif q.data == "suggest":
+    elif q.data=="suggest":
         await q.edit_message_reply_markup(None)
-        await q.message.reply_text("💬 Расскажи что хочешь изменить — скорректирую!")
+        await q.message.reply_text("💬 Расскажи что хочешь изменить!")
 
-    elif q.data == "skip_today":
-        data["streak"] = 0
-        week = get_week_key()
-        data.setdefault("weekly_stats", {}).setdefault(week, {"done":0,"skipped":0,"total_km":0})["skipped"] += 1
-        reply = ask_groq(data, "Пропускает сегодня. 1 предл., пойми и мотивируй на завтра. Без JSON.")
-        save_data(data)
+    elif q.data=="skip":
+        d["streak"]=0
+        d.setdefault("weekly",{}).setdefault(week_key(),{"done":0,"skipped":0,"km":0})["skipped"]+=1
+        reply = ask(d,"Пропускает сегодня. 1 предл. — пойми и мотивируй на завтра."); save(d)
         await q.edit_message_reply_markup(None)
-        await q.message.reply_text(reply)
+        await q.message.reply_text(reply or "Окей, завтра выходим! 💪")
 
-    elif q.data == "photo_run":
-        await q.edit_message_reply_markup(None)
-        await q.message.reply_text("Окей, введи данные вручную:\n/done — если выполнил тренировку\nИли напиши дистанцию и время, например: 'пробежал 5 км за 28 минут'")
-
-    elif q.data == "photo_equipment":
-        await q.edit_message_reply_markup(None)
-        await q.message.reply_text("Напиши название тренажёра — добавлю в программу!")
-
-    elif q.data == "photo_food":
-        await q.edit_message_reply_markup(None)
-        await q.message.reply_text("Напиши что ел — оценю примерно!")
-
-    elif q.data == "rebuild_workout":
-        equipment = data.get("equipment", [])
-        eq_list = "\n".join([f"- {e['name']} ({e['muscle_group']})" for e in equipment])
-        weekday = datetime.now(TIMEZONE).strftime("%A")
-        reply = ask_groq(data,
-            f"Перестрой тренировку на {weekday} с тренажёрами:\n{eq_list}\n"
-            "Ответь ТОЛЬКО чистым JSON workout."
-        )
-        w = parse_json(reply)
-        if w and w.get("type") == "workout":
-            data["pending_workout"] = w
-            data["workout_accepted"] = False
-            save_data(data)
+    elif q.data=="rebuild":
+        eq = "\n".join([f"- {e['name']} ({e['muscle_group']})" for e in d.get("equipment",[])])
+        wday = datetime.now(TIMEZONE).strftime("%A")
+        reply = ask(d, f"Составь тренировку на {wday} под эти тренажёры:\n{eq}\nТОЛЬКО JSON workout.")
+        wo = pj(reply)
+        if wo and wo.get("type")=="workout":
+            d["pending"]=wo; d["accepted"]=False; save(d)
             await q.edit_message_reply_markup(None)
-            await q.message.reply_text(
-                f"🔄 *Перестроено под твою площадку:*\n\n{fmt_workout(w)}",
-                parse_mode="Markdown", reply_markup=accept_kb()
-            )
+            await q.message.reply_text(f"🔄 *Под твою площадку:*\n\n{fmt_wo(wo)}", parse_mode="Markdown", reply_markup=accept_kb())
 
-    elif q.data == "more_equipment":
+    elif q.data=="more_eq":
         await q.edit_message_reply_markup(None)
         await q.message.reply_text("📷 Скидывай следующее фото тренажёра!")
 
-    elif q.data.startswith("ch_"):
-        challenges_map = {
-            "ch_7days":  {"name": "7 дней подряд", "type": "no_skip", "target": 7},
-            "ch_30days": {"name": "30 дней подряд", "type": "no_skip", "target": 30},
-            "ch_50km":   {"name": "50 км за месяц", "type": "run_km", "target": 50},
-            "ch_100km":  {"name": "100 км за месяц", "type": "run_km", "target": 100},
-        }
-        ch = challenges_map.get(q.data)
-        if ch:
-            data.setdefault("challenges", []).append({**ch, "done": False,
-                "started": datetime.now(TIMEZONE).strftime("%Y-%m-%d")})
-            save_data(data)
-            await q.edit_message_reply_markup(None)
-            await q.message.reply_text(
-                f"🎯 *Челлендж принят: {ch['name']}!*\n\nПроверить прогресс: /challenge",
-                parse_mode="Markdown"
-            )
+    elif q.data in ("ph_run","ph_eq","ph_food"):
+        hints = {"ph_run":"Напиши: «пробежал 5 км за 28 минут, старт в 7:15»",
+                 "ph_eq":"Напиши: «добавь тренажёр: жим лёжа, грудь, 4×10»",
+                 "ph_food":"Напиши: «гречка с курицей 300г»"}
+        await q.edit_message_reply_markup(None)
+        await q.message.reply_text(hints[q.data])
+
+    elif q.data in ("ch7","ch30","ch50","ch100"):
+        chmap = {"ch7":{"name":"7 дней подряд","type":"no_skip","target":7},
+                 "ch30":{"name":"30 дней подряд","type":"no_skip","target":30},
+                 "ch50":{"name":"50 км за месяц","type":"km","target":50},
+                 "ch100":{"name":"100 км за месяц","type":"km","target":100}}
+        ch = chmap[q.data]; d.setdefault("challenges",[]).append({**ch,"done":False,"started":today_str()}); save(d)
+        await q.edit_message_reply_markup(None)
+        await q.message.reply_text(f"🎯 *Челлендж: {ch['name']}!*\n/challenge — прогресс", parse_mode="Markdown")
 
 # ─── ЧАТ ──────────────────────────────────────────────────────────────────────
-async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat.id != YOUR_CHAT_ID:
-        return
-    data = load_data()
-    text = update.message.text
-    lower = text.lower()
+async def on_msg(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    if u.effective_chat.id != YOUR_CHAT_ID: return
+    d = load(); text = u.message.text; low = text.lower()
 
-    # Запоминаем предпочтения
-    prefs = data.setdefault("preferences", [])
-    for kw in ["не люблю", "терпеть не могу", "обожаю", "люблю", "предпочитаю"]:
-        if kw in lower and len(text) < 100:
-            if text not in prefs:
-                prefs.append(text)
+    # Предпочтения
+    for kw in ["не люблю","терпеть не могу","обожаю","люблю","предпочитаю"]:
+        if kw in low and len(text)<120:
+            if text not in d.setdefault("prefs",[]): d["prefs"].append(text)
 
-    # Пожелания на завтра — запоминаем, не присылаем тренировку
-    tomorrow_hints = ["завтра", "хочу побегать", "хочу бег", "хочу на площадку",
-                      "хочу велик", "планирую", "собираюсь"]
-    if any(h in lower for h in tomorrow_hints):
-        data.setdefault("tomorrow_wishes", []).append(text)
-        save_data(data)
-        reply = ask_groq(data,
-            f"Пользователь говорит о планах: '{text}'. "
-            "Ответь тепло, запомни пожелание, скажи что учтёшь в плане в 20:00. "
-            "НЕ присылай тренировку. Без JSON."
-        )
-        await update.message.reply_text(reply)
+    # Пожелания на завтра
+    if any(h in low for h in ["завтра","хочу побегать","хочу бег","хочу площадку","планирую","собираюсь"]):
+        d.setdefault("wishes",[]).append(text); save(d)
+        reply = ask(d, f"Пользователь: '{text}'. Ответь тепло, скажи что учтёшь в плане в 20:00. НЕ присылай тренировку.")
+        await u.message.reply_text(reply or "Запомнил! Учту в вечернем плане 👍"); return
+
+    # Боль/самочувствие
+    if any(h in low for h in ["болит","боль","ломит","колено","спина","плечо","не могу"]):
+        d.setdefault("feeling_log",[]).append({"ts":datetime.now(TIMEZONE).isoformat(),"pain":text[:100]}); save(d)
+        reply = ask(d, f"Пользователь о самочувствии: '{text}'. Уточни, запомни. НЕ присылай тренировку.")
+        await u.message.reply_text(reply or "Понял, учту при составлении тренировки."); return
+
+    # Добавление тренажёра текстом
+    if any(h in low for h in ["добавь тренажёр","добавь тренажер","добавь снаряд"]):
+        reply = ask(d, f"Пользователь просит добавить тренажёр: '{text}'. Распарси и ответь JSON equipment.")
+        eq = pj(reply)
+        if eq and eq.get("type")=="equipment":
+            name = eq.get("name","")
+            eq_list = d.setdefault("equipment",[])
+            if name and name not in [e.get("name") for e in eq_list]:
+                eq_list.append({"name":name,"muscle_group":eq.get("muscle_group",""),"sets_reps":eq.get("sets_reps","4×12")}); save(d)
+                await u.message.reply_text(f"✅ Добавил: *{name}*", parse_mode="Markdown")
+            else:
+                await u.message.reply_text(f"_{name} уже есть в программе_", parse_mode="Markdown")
+        else:
+            await u.message.reply_text("Не понял. Напиши например: «добавь тренажёр: жим лёжа, грудь, 4×10»")
         return
 
-    # Самочувствие в тексте — сохраняем
-    pain_hints = ["болит", "боль", "устал", "ломит", "тянет", "колено", "спина", "плечо"]
-    if any(h in lower for h in pain_hints):
-        reply = ask_groq(data,
-            f"Пользователь говорит о самочувствии: '{text}'. "
-            "Уточни где болит и как сильно. Запомни чтобы учесть в тренировке. Без JSON."
-        )
-        # Сохраняем в feeling_log
-        data.setdefault("feeling_log", []).append({
-            "timestamp": datetime.now(TIMEZONE).isoformat(),
-            "pain": text[:50],
-            "energy": 3
-        })
-        save_data(data)
-        await update.message.reply_text(reply)
-        return
+    # Ручной ввод пробежки
+    km_m = re.search(r'(\d+[.,]?\d*)\s*км', low)
+    if km_m and any(w in low for w in ["пробежал","побежал","бежал","пробежка","пробежку"]):
+        km = float(km_m.group(1).replace(",",".")); rec = {"ts":datetime.now(TIMEZONE).isoformat(),"distance_km":km,"manual":True}
+        tm = re.search(r'(\d+)\s*мин', low)
+        if tm:
+            mins = int(tm.group(1)); rec["duration"] = f"0:{mins:02d}" if mins<60 else f"{mins//60}:{mins%60:02d}"
+            if km>0: ps = int(mins*60/km); rec["pace_avg"] = f"{ps//60}:{ps%60:02d}/км"
+        d.setdefault("runs",[]).append(rec); is_rec=add_km(d,km); do_streak(d)
+        d.setdefault("weekly",{}).setdefault(week_key(),{"done":0,"skipped":0,"km":0})["done"]+=1
+        ach=check_ach(d); save(d)
+        reply = ask(d, f"Зафиксировал пробежку {km} км. Похвали коротко и попроси оценку 1-5.")
+        txt = f"✅ *{km} км зафиксировано!*" + (" 🏆 Новый рекорд!" if is_rec else "")
+        if ach: txt += "\n"+"\n".join(ach)
+        txt += f"\n\n{reply or 'Оцени сложность:'}"
+        await u.message.reply_text(txt, parse_mode="Markdown", reply_markup=rating_kb()); return
 
     # Обычный разговор
-    reply = ask_groq(data,
-        f"Пользователь: '{text}'. Ответь как тренер — коротко, по делу. "
-        "НЕ присылай тренировку если не просит явно. Без JSON."
-    )
-    save_data(data)
-    w = parse_json(reply)
-    if w and w.get("type") == "workout":
-        await update.message.reply_text(
-            "Вот примерный план — финальное задание пришлю в 20:00:\n\n" + fmt_workout(w),
-            parse_mode="Markdown"
-        )
+    reply = ask(d, text); save(d)
+    wo = pj(reply)
+    if wo and wo.get("type")=="workout":
+        await u.message.reply_text("Вот примерный план — финальный пришлю в 20:00:\n\n"+fmt_wo(wo), parse_mode="Markdown")
+    elif reply:
+        await u.message.reply_text(reply)
     else:
-        await update.message.reply_text(reply)
+        await u.message.reply_text("Не понял, попробуй ещё раз.")
 
 # ─── ПЛАНИРОВЩИК ──────────────────────────────────────────────────────────────
-async def job_wakeup(app: Application):
-    """6:30 — подъём с кнопками принятия"""
-    data = load_data()
-    w = data.get("pending_workout")
-    weather = get_weather(target_hour=7)
-    weather_str = fmt_weather(weather, "сегодня")
+async def job_wakeup(app):
+    try:
+        d = load(); wo = d.get("pending"); wth = weather(7); wstr = fmt_w(wth,"сегодня")
+        if d.get("accepted") and wo:
+            txt = f"🌅 *6:30 — Подъём!* 💪{wstr}\n\nТы принял тренировку — вперёд!\n\n{fmt_wo(wo)}\n\n_Закончишь — /done и скрин 📷_"
+            await app.bot.send_message(YOUR_CHAT_ID, txt, parse_mode="Markdown")
+        elif wo:
+            txt = f"🌅 *6:30 — Подъём!* 💪{wstr}\n\nЗадание на сегодня:\n\n{fmt_wo(wo)}"
+            await app.bot.send_message(YOUR_CHAT_ID, txt, parse_mode="Markdown", reply_markup=accept_kb())
+        else:
+            await app.bot.send_message(YOUR_CHAT_ID, f"🌅 *6:30 — Подъём!* 💪{wstr}\n\n/workout — получить задание", parse_mode="Markdown")
+    except Exception as e: log.error(f"job_wakeup: {e}")
 
-    if data.get("workout_accepted"):
-        text = (f"🌅 *6:30 — Подъём!* 💪{weather_str}\n\n"
-                f"Ты принял тренировку — вперёд!\n\n"
-                f"{fmt_workout(w) if w else ''}\n\n"
-                f"Когда закончишь — /done и скрин 📷")
-        await app.bot.send_message(YOUR_CHAT_ID, text, parse_mode="Markdown")
-    elif w:
-        text = f"🌅 *6:30 — Подъём!* 💪{weather_str}\n\nЗадание на сегодня:\n\n{fmt_workout(w)}"
-        await app.bot.send_message(YOUR_CHAT_ID, text, parse_mode="Markdown", reply_markup=accept_kb())
-    else:
+async def job_evening(app):
+    try:
+        d = load()
+        wday = (datetime.now(TIMEZONE)+timedelta(days=1)).strftime("%A")
+        wth = weather(7); bike = wth.get("bike",True); wstr = fmt_w(wth,"завтрашнее утро")
+        wctx = f"Погода завтра: {wth.get('summary','')}. {'Велик берём.' if bike else 'Велик НЕ берём.'} " if wth else ""
+        wishes = d.get("wishes",[]); wsh = f"Пожелания: {'; '.join(wishes[-2:])}. Учти! " if wishes else ""
+        if wishes: d["wishes"] = []
+        fl = d.get("feeling_log",[]); pain = f"Боль: {fl[-1]['pain']} — исключи. " if fl and fl[-1].get("pain") and "нет" not in str(fl[-1].get("pain","")) else ""
+        reply = ask(d, f"Составь план на завтра ({wday}). {wctx}{wsh}{pain}ТОЛЬКО JSON workout.")
+        wo = pj(reply)
+        if wo and wo.get("type")=="workout":
+            if not bike: wo["bike"]=False
+            d["pending"]=wo; d["accepted"]=False; save(d)
+            kb = InlineKeyboardMarkup([[InlineKeyboardButton("💬 Хочу изменить",callback_data="suggest")]])
+            await app.bot.send_message(YOUR_CHAT_ID,
+                f"🌙 *План на завтра:*{wstr}\n\n{fmt_wo(wo)}\n\n_Утром в 6:30 — с кнопками принятия._",
+                parse_mode="Markdown", reply_markup=kb)
+        else:
+            log.error(f"job_evening failed, reply: {reply[:100] if reply else 'empty'}")
+            # Fallback — простое сообщение
+            await app.bot.send_message(YOUR_CHAT_ID, "🌙 Напиши /workout чтобы получить задание на завтра.")
+    except Exception as e: log.error(f"job_evening: {e}")
+
+async def job_motivation(app):
+    try:
+        d = load()
+        if d.get("last_date") != today_str():
+            reply = ask(d,"Не тренировался сегодня. Подстегни — 1-2 предл., учти психологию пользователя.")
+            if reply: await app.bot.send_message(YOUR_CHAT_ID, f"⚡ {reply}")
+    except Exception as e: log.error(f"job_motivation: {e}")
+
+async def job_weekly(app):
+    try:
+        d = load(); stats = d.get("weekly",{}); keys = sorted(stats.keys())
+        tw = stats.get(week_key(),{"done":0,"skipped":0,"km":0})
+        pw = stats.get(keys[-2],{}) if len(keys)>=2 else {}
+        cmp = ""
+        if pw:
+            dk=tw.get("km",0)-pw.get("km",0); dd=tw.get("done",0)-pw.get("done",0)
+            cmp = f"\n*Vs прошлая неделя:* {'📈' if dk>=0 else '📉'}{'+' if dk>=0 else ''}{dk:.1f} км  {'📈' if dd>=0 else '📉'}{dd:+d} тр.\n"
+        reply = ask(d,
+            f"Итоги: {tw.get('done',0)} тр., {tw.get('skipped',0)} пр., {tw.get('km',0):.1f} км, серия {d.get('streak',0)} дн."
+            +(f" Прошлая: {pw.get('km',0):.1f} км." if pw else "")
+            +" Анализ (3-4 предл.) + цель на след. неделю.")
         await app.bot.send_message(YOUR_CHAT_ID,
-            f"🌅 *6:30 — Подъём!* 💪{weather_str}\n\nНапиши /workout для задания!",
+            f"📊 *ИТОГИ НЕДЕЛИ*\n\n✅{tw.get('done',0)} тр. ❌{tw.get('skipped',0)} пр. 🏃{tw.get('km',0):.1f} км 🔥{d.get('streak',0)} дн.\n{cmp}\n{reply or ''}",
             parse_mode="Markdown")
+    except Exception as e: log.error(f"job_weekly: {e}")
 
-async def job_evening(app: Application):
-    """20:00 — план на завтра (информационно)"""
-    data = load_data()
-    tomorrow = (datetime.now(TIMEZONE) + timedelta(days=1)).strftime("%A")
-    weather = get_weather(target_hour=7)
-    bike_ok = weather.get("bike_ok", True)
-    weather_str = fmt_weather(weather, "завтрашнее утро")
-    weather_ctx = f"Погода: {weather.get('summary','')}. {'Велик берём.' if bike_ok else 'Велик НЕ берём.'} " if weather else ""
-    wishes = data.get("tomorrow_wishes", [])
-    wishes_ctx = f"Пожелания: {'; '.join(wishes[-3:])}. Учти! " if wishes else ""
-    if wishes:
-        data["tomorrow_wishes"] = []
-
-    # Учитываем самочувствие
-    feeling_log = data.get("feeling_log", [])
-    feeling_ctx = ""
-    if feeling_log:
-        lf = feeling_log[-1]
-        if lf.get("pain") and "нет" not in str(lf.get("pain","")):
-            feeling_ctx = f"Боль: {lf['pain']} — избегай эту зону. "
-
-    reply = ask_groq(data,
-        f"Составь план на завтра ({tomorrow}). {weather_ctx}{wishes_ctx}{feeling_ctx}"
-        "Ответь ТОЛЬКО чистым JSON workout."
-    )
-    w = parse_json(reply)
-    if w and w.get("type") == "workout":
-        if not bike_ok:
-            w["bike"] = False
-        data["pending_workout"] = w
-        data["workout_accepted"] = False
-        save_data(data)
-        keyboard = InlineKeyboardMarkup([[
-            InlineKeyboardButton("💬 Хочу изменить", callback_data="suggest"),
-        ]])
-        await app.bot.send_message(
-            YOUR_CHAT_ID,
-            f"🌙 *План на завтра:*{weather_str}\n\n{fmt_workout(w)}\n\n"
-            f"_Утром в 6:30 — напоминание с кнопками принятия._",
-            parse_mode="Markdown", reply_markup=keyboard
-        )
-
-async def job_motivation(app: Application):
-    """14:00 — мотивация если не тренировался"""
-    data = load_data()
-    today = datetime.now(TIMEZONE).strftime("%Y-%m-%d")
-    if data.get("last_workout_date") != today:
-        reply = ask_groq(data,
-            "Не тренировался сегодня. Подстегни — коротко, учти психологию. 1-2 предл. Без JSON.")
-        await app.bot.send_message(YOUR_CHAT_ID, f"⚡ {reply}")
-
-async def job_weekly(app: Application):
-    """Воскресенье 19:00 — итоги с сравнением недель"""
-    data = load_data()
-    stats = data.get("weekly_stats", {})
-    week_keys = sorted(stats.keys())
-
-    this_week = stats.get(get_week_key(), {"done":0,"skipped":0,"total_km":0})
-
-    # Прошлая неделя для сравнения
-    prev_key = None
-    if len(week_keys) >= 2:
-        prev_key = week_keys[-2]
-    prev_week = stats.get(prev_key, {}) if prev_key else {}
-
-    comparison = ""
-    if prev_week:
-        diff_km = this_week.get("total_km",0) - prev_week.get("total_km",0)
-        diff_done = this_week.get("done",0) - prev_week.get("done",0)
-        comparison = (
-            f"\n*Сравнение с прошлой неделей:*\n"
-            f"{'📈' if diff_km >= 0 else '📉'} Км: {'+' if diff_km>=0 else ''}{diff_km:.1f}\n"
-            f"{'📈' if diff_done >= 0 else '📉'} Тренировок: {'+' if diff_done>=0 else ''}{diff_done}\n"
-        )
-
-    prompt = (
-        f"Итоги: {this_week.get('done',0)} тр., {this_week.get('skipped',0)} пропусков, "
-        f"{this_week.get('total_km',0):.1f} км, серия {data.get('streak',0)} дней. "
-        + (f"Прошлая неделя: {prev_week.get('total_km',0):.1f} км, {prev_week.get('done',0)} тр. " if prev_week else "")
-        + "Анализ (3-4 предл.): прогресс, паттерны, цель на след. неделю. Без JSON."
-    )
-    reply = ask_groq(data, prompt)
-    await app.bot.send_message(
-        YOUR_CHAT_ID,
-        f"📊 *ИТОГИ НЕДЕЛИ*\n\n"
-        f"✅ {this_week.get('done',0)} тр.  ❌ {this_week.get('skipped',0)} пропусков\n"
-        f"🏃 {this_week.get('total_km',0):.1f} км  🔥 серия {data.get('streak',0)} дней\n"
-        f"{comparison}\n{reply}",
-        parse_mode="Markdown"
-    )
-
-async def job_weight_reminder(app: Application):
-    """Понедельник 9:00 — взвешивание"""
-    data = load_data()
-    weight_log = data.get("weight_log", [])
-    last = weight_log[-1]["weight"] if weight_log else 94
-    await app.bot.send_message(
-        YOUR_CHAT_ID,
-        f"⚖️ *Взвешивание!*\nПоследний вес: {last} кг\n\nЗапиши: /weight 93.5",
-        parse_mode="Markdown"
-    )
-
-async def job_monthly_export(app: Application):
-    """1-е число месяца — экспорт данных"""
-    data = load_data()
-    prev_month = (datetime.now(TIMEZONE) - timedelta(days=1)).strftime("%Y-%m")
-    csv_bytes = export_csv(data)
-    await app.bot.send_document(
-        YOUR_CHAT_ID,
-        document=io.BytesIO(csv_bytes),
-        filename=f"тренировки_{prev_month}.csv",
-        caption=f"📊 Твои данные за {prev_month} — держи архив!"
-    )
+async def job_weight(app):
+    try:
+        d = load(); wl = d.get("weight_log",[{}])
+        await app.bot.send_message(YOUR_CHAT_ID,
+            f"⚖️ *Понедельник — взвешивание!*\nПоследний вес: {wl[-1].get('weight','?')} кг\n\n/weight 93.5",
+            parse_mode="Markdown")
+    except Exception as e: log.error(f"job_weight: {e}")
 
 # ─── MAIN ─────────────────────────────────────────────────────────────────────
 def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
-
     app.add_handler(CommandHandler("start",     cmd_start))
     app.add_handler(CommandHandler("workout",   cmd_workout))
     app.add_handler(CommandHandler("done",      cmd_done))
     app.add_handler(CommandHandler("skip",      cmd_skip))
     app.add_handler(CommandHandler("weight",    cmd_weight))
-    app.add_handler(CommandHandler("feeling",   cmd_feeling))
+    app.add_handler(CommandHandler("stats",     cmd_stats))
     app.add_handler(CommandHandler("records",   cmd_records))
     app.add_handler(CommandHandler("challenge", cmd_challenge))
     app.add_handler(CommandHandler("export",    cmd_export))
-    app.add_handler(CommandHandler("stats",     cmd_stats))
-    app.add_handler(CommandHandler("profile",   cmd_profile))
     app.add_handler(MessageHandler(filters.PHOTO, on_photo))
     app.add_handler(MessageHandler(filters.VOICE, on_voice))
-    app.add_handler(CallbackQueryHandler(on_button))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
+    app.add_handler(CallbackQueryHandler(on_btn))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_msg))
 
-    scheduler = AsyncIOScheduler(timezone=TIMEZONE)
-    scheduler.add_job(job_wakeup,         "cron", hour=6,  minute=30, args=[app])
-    scheduler.add_job(job_motivation,     "cron", hour=14, minute=0,  args=[app])
-    scheduler.add_job(job_evening,        "cron", hour=20, minute=0,  args=[app])
-    scheduler.add_job(job_weekly,         "cron", day_of_week="sun",  hour=19, args=[app])
-    scheduler.add_job(job_weight_reminder,"cron", day_of_week="mon",  hour=9,  args=[app])
-    scheduler.add_job(job_monthly_export, "cron", day=1, hour=10, args=[app])
-    scheduler.start()
+    sched = AsyncIOScheduler(timezone=TIMEZONE)
+    sched.add_job(job_wakeup,    "cron", hour=6,  minute=30, args=[app], misfire_grace_time=600)
+    sched.add_job(job_motivation,"cron", hour=14, minute=0,  args=[app], misfire_grace_time=600)
+    sched.add_job(job_evening,   "cron", hour=20, minute=0,  args=[app], misfire_grace_time=600)
+    sched.add_job(job_weekly,    "cron", day_of_week="sun", hour=19, args=[app], misfire_grace_time=600)
+    sched.add_job(job_weight,    "cron", day_of_week="mon", hour=9,  args=[app], misfire_grace_time=600)
+    sched.start()
 
-    log.info("✅ Бот Макс запущен!")
+    log.info("✅ Тренер Макс v4.0 запущен!")
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
